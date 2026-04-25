@@ -1,4 +1,4 @@
-# NavSense Requirements - Phase 1
+# NavSense Ai assistant Requirements - Phase 1 
 # Core dependencies for object detection, camera, and voice interface
 
 # Computer Vision & Detection
