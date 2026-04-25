@@ -1,0 +1,68 @@
+{
+  "indoor": [
+    "indoor", "indore", "inside", "internal", "in-door", "indoors", "into", "entering", "room", "house", "home", "hallway", "apartment", "kitchen", "bedroom", "living room", "bathroom", "office", "workplace", "shop", "store", "mall", "hospital", "school", "library", "corridor", "lobby", "elevator", "stairs", "basement", "attic", "garage", "pantry", "closet", "entryway", "foyer", "veranda", "porch", "cabin", "cottage", "palace", "castle", "temple", "church", "mosque", "synagogue", "theater", "cinema", "gym", "restaurant", "cafe", "bar", "pub", "hotel", "hostel", "dormitory", "classroom", "laboratory", "workshop", "studio", "gallery", "museum", "bank", "post office", "station", "airport", "terminal", "warehouse", "factory", "shelter", "bunker", "cave", "tunnel", "underground", "inner", "interior", "within", "inside of", "middle of", "center of", "enclosed", "indoor mode", "switch to indoor", "go indoor", "take me indoor", "activate indoor", "indoor assistant", "indoor navigation"
+  ],
+  "outdoor": [
+    "outdoor", "outside", "external", "out-door", "outdoors", "out", "exit", "leaving", "street", "road", "sidewalk", "park", "garden", "public", "forest", "field", "mountain", "beach", "ocean", "river", "lake", "pool", "stadium", "playground", "market", "square", "plaza", "avenue", "path", "trail", "bridge", "tunnel", "highway", "expressway", "crosswalk", "intersection", "pavement", "curb", "lawn", "yard", "balcony", "terrace", "rooftop", "island", "desert", "jungle", "wilderness", "nature", "countryside", "farm", "village", "town", "city", "neighborhood", "district", "suburb", "urban", "rural", "coast", "shore", "waterfront", "dock", "pier", "harbor", "marina", "camp", "site", "base", "exterior", "outer", "outside of", "beyond", "open air", "fresh air", "outdoor mode", "switch to outdoor", "go outdoor", "take me outdoor", "activate outdoor", "outdoor assistant", "outdoor navigation"
+  ],
+  "jarvis": [
+    "jarvis", "jarvish", "jarvas", "jarvis mode", "ai mode", "jardish", "zaris", "zaras", "service", "charvis", "assistant", "ai", "companion", "helper", "chatter", "chat", "talk", "speak", "robot", "machine", "bot", "brain", "intelligence", "smart", "know", "question", "ask", "answer", "query", "request", "order", "command", "tell", "show", "describe", "explain", "help", "guide", "support", "advice", "search", "find", "look", "see", "watch", "observe", "scan", "monitor", "check", "verify", "alert", "warn", "advise", "suggest", "recommend", "plan", "schedule", "remind", "note", "list", "read", "write", "type", "play", "music", "video", "call", "send", "receive", "mail", "message", "news", "weather", "time", "date", "calculate", "math", "translation", "translate", "speak to me", "talk to me", "hey jarvis", "hi jarvis", "hello jarvis", "activate jarvis", "start jarvis", "jarvis assistant", "jarvis ai"
+  ],
+  "person": [
+    "person", "people", "human", "man", "woman", "child", "someone", "anyone"
+  ],
+  "chair": [
+    "chair", "seat", "stool"
+  ],
+  "bench": [
+    "bench", "park bench"
+  ],
+  "couch": [
+    "couch", "sofa"
+  ],
+  "dining table": [
+    "dining table", "table", "desk", "counter"
+  ],
+  "tv": [
+    "tv", "television", "screen", "monitor", "display"
+  ],
+  "laptop": [
+    "laptop", "computer", "pc", "macbook"
+  ],
+  "cell phone": [
+    "cell phone", "phone", "mobile", "smartphone", "iphone"
+  ],
+  "traffic light": [
+    "traffic light", "signal"
+  ],
+  "stop sign": [
+    "stop sign"
+  ],
+  "refrigerator": [
+    "refrigerator", "fridge"
+  ],
+  "bottle": [
+    "bottle", "water bottle"
+  ],
+  "backpack": [
+    "backpack", "bag"
+  ],
+  "car": [
+    "car", "vehicle", "automobile"
+  ],
+  "bus": [
+    "bus"
+  ],
+  "truck": [
+    "truck"
+  ],
+  "bicycle": [
+    "bicycle", "bike", "cycle"
+  ],
+  "motorcycle": [
+    "motorcycle", "motorbike"
+  ],
+  "dog": [
+    "dog", "puppy"
+  ]
+}

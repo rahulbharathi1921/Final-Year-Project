@@ -1,0 +1,25 @@
+# NavSense Requirements - Phase 1
+# Core dependencies for object detection, camera, and voice interface
+
+# Computer Vision & Detection
+opencv-python>=4.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+ultralytics>=8.0.0
+scipy>=1.10.0
+
+# Voice Recognition & TTS
+SpeechRecognition>=3.10.0
+pyttsx3>=2.90
+pyaudio>=0.2.13
+
+# LLM Integration (Phase 2)
+requests>=2.31.0
+
+# Utilities
+pyyaml>=6.0
+pillow>=10.0.0
+
+# Optional but recommended for better performance
+# pip install --upgrade pip setuptools wheel

@@ -1,0 +1,16 @@
+# NavSense - Current Local Files Only
+
+# Python Bytecode
+__pycache__/
+
+# Large Model Files
+models/SmolLM2-135M-Instruct-Q8_0.gguf
+models/yolo26n.pt
+models/yolov5n.pt
+models/yolov5s.pt
+
+# Session Logs
+logs/
+
+# Local System Configuration
+config/settings.yaml
