@@ -18,6 +18,9 @@ from pathlib import Path
 from collections import deque
 import difflib
 import re
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Import core modules
 from core.camera_handler import CameraHandler
@@ -154,12 +157,12 @@ class NavSense:
                 return False
             
             # Initialize LLM handler (Phase 2)
-            print("\n[6/7] Initializing LLM (Ollama phi3)...")
+            print("\n[6/7] Initializing LLM (Gemini API)...")
             self.llm = LLMHandler(self.config['llm'])
             if self.llm.check_connection():
                 print("[6/7] LLM initialized successfully")
             else:
-                print("[6/7] ⚠️ LLM not available (continuing without)")
+                print("[6/7] LLM not available (set GEMINI_API_KEY to enable Gemini)")
             
             # Initialize tracker (Phase 2)
             print("\n[7/7] Initializing object tracker...")
@@ -342,6 +345,14 @@ class NavSense:
         if text in noise_phrases:
             return False
         return text.startswith(query_starters)
+
+    def _is_scene_summary_query(self, text: str) -> bool:
+        """Detect broad scene-description requests that should not go to the LLM first."""
+        scene_phrases = (
+            'tell me about all', 'tell me about them', 'all of them', 'around me',
+            'what do you see', 'describe the scene', 'describe around', 'scan'
+        )
+        return any(phrase in text for phrase in scene_phrases)
 
     def _handle_count_query(self, text: str) -> bool:
         """Handle questions like 'how many cars can you see'."""
@@ -598,6 +609,10 @@ class NavSense:
         Mixed rule-based + LLM query handler.
         """
         detections = self._get_last_detections_snapshot()
+        if self._is_scene_summary_query(text) or text in {'tell me', 'describe'}:
+            self._handle_scene_query()
+            return
+
         asked_class = self._extract_target_object(text)
         if asked_class:
             matches = self._find_detection_matches(asked_class, detections)
@@ -624,6 +639,9 @@ class NavSense:
             if response:
                 self._speak_and_remember(response, priority=True)
                 return
+
+            self._handle_scene_query()
+            return
 
         if not detections:
             self._speak_and_remember("I do not see anything right now.", priority=True)
@@ -1008,6 +1026,12 @@ class NavSense:
         """Draw detection on frame with labels that don't get cut off."""
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = detection['bbox']
+        x1 = max(0, min(w - 1, int(x1)))
+        y1 = max(0, min(h - 1, int(y1)))
+        x2 = max(0, min(w - 1, int(x2)))
+        y2 = max(0, min(h - 1, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return
         class_name = detection['class_name']
         confidence = detection['confidence']
         distance = detection.get('distance', 0)
@@ -1021,8 +1045,22 @@ class NavSense:
         else:
             color = (255, 0, 0)  # Blue - far
         
-        # Draw bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        box_w = x2 - x1
+        box_h = y2 - y1
+        huge_box = (box_w / w) > 0.82 or (box_h / h) > 0.82
+
+        if huge_box:
+            corner = max(20, min(box_w, box_h) // 8)
+            cv2.line(frame, (x1, y1), (x1 + corner, y1), color, 2)
+            cv2.line(frame, (x1, y1), (x1, y1 + corner), color, 2)
+            cv2.line(frame, (x2, y1), (x2 - corner, y1), color, 2)
+            cv2.line(frame, (x2, y1), (x2, y1 + corner), color, 2)
+            cv2.line(frame, (x1, y2), (x1 + corner, y2), color, 2)
+            cv2.line(frame, (x1, y2), (x1, y2 - corner), color, 2)
+            cv2.line(frame, (x2, y2), (x2 - corner, y2), color, 2)
+            cv2.line(frame, (x2, y2), (x2, y2 - corner), color, 2)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
         # 1. Top Label (Class & Confidence)
         label = f"{class_name} {confidence:.2f}"

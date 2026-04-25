@@ -16,6 +16,7 @@ pyaudio>=0.2.13
 
 # LLM Integration (Phase 2)
 requests>=2.31.0
+python-dotenv>=1.0.1
 
 # Utilities
 pyyaml>=6.0
