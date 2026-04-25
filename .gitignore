@@ -8,6 +8,7 @@ models/SmolLM2-135M-Instruct-Q8_0.gguf
 models/yolo26n.pt
 models/yolov5n.pt
 models/yolov5s.pt
+models/yolov5nu.pt
 
 # Session Logs
 logs/

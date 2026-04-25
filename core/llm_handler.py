@@ -2,6 +2,7 @@
 LLM handler for optional Jarvis-style responses.
 """
 
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,34 @@ class LLMHandler:
             return self._generate_gemini(prompt, system_prompt)
         return self._generate_ollama(prompt, system_prompt)
 
+    def _sanitize_response(self, text: Optional[str]) -> Optional[str]:
+        """Strip echoed prompt metadata before speaking the result."""
+        if not text:
+            return None
+
+        cleaned_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith(("DETECTED OBJECTS:", "HISTORY:", "USER:", "NAVSENSE:", "ASSISTANT:")):
+                continue
+            if line.lower().startswith(("user:", "assistant:")):
+                continue
+            cleaned_lines.append(line)
+
+        cleaned = " ".join(cleaned_lines).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if not cleaned:
+            return None
+
+        meta_tokens = ["detected objects", "history:", "navsense:", "<|im_start|>", "<|im_end|>"]
+        if any(token in cleaned.lower() for token in meta_tokens):
+            return None
+
+        return cleaned[:220].strip()
+
     def _generate_gguf(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
         if not LLAMA_CPP_AVAILABLE:
             print("[LLMHandler] llama-cpp-python not available")
@@ -104,7 +133,7 @@ class LLMHandler:
                 stop=["<|im_end|>", "<|im_start|>"],
                 echo=False,
             )
-            text = output["choices"][0]["text"].strip()
+            text = self._sanitize_response(output["choices"][0]["text"].strip())
             print(f"[LLMHandler] GGUF replied in {time.time() - start:.1f}s")
             return text
         except Exception as exc:
@@ -135,7 +164,7 @@ class LLMHandler:
                 return None
 
             parts = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            return parts[0].get("text", "").strip() if parts else None
+            return self._sanitize_response(parts[0].get("text", "").strip() if parts else None)
         except Exception as exc:
             print(f"[LLMHandler] Gemini exception: {exc}")
             return None
@@ -161,7 +190,7 @@ class LLMHandler:
             if response.status_code != 200:
                 return None
 
-            generated_text = response.json().get("response", "").strip()
+            generated_text = self._sanitize_response(response.json().get("response", "").strip())
             self.response_cache[cache_key] = (generated_text, time.time())
             return generated_text
         except Exception as exc:
@@ -213,7 +242,8 @@ class LLMHandler:
 
         prompt = f"{context}USER: {question}\nNAVSENSE:"
         system_prompt = (
-            "You are JARVIS. Answer precisely and concisely based on detected objects only."
+            "You are JARVIS. Answer concisely. Use detected objects for surroundings questions, "
+            "and answer directly for general knowledge questions."
         )
         response = self._generate(prompt, system_prompt)
         return response or "I am having trouble processing that request right now."
@@ -235,4 +265,3 @@ class LLMHandler:
             f"The {match.get('class_name', object_name)} is {match.get('distance', 0):.1f} meters "
             f"{match.get('direction_text', 'nearby')}."
         )
-

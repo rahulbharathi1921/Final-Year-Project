@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from collections import deque
 import difflib
+import re
 
 # Import core modules
 from core.camera_handler import CameraHandler
@@ -290,21 +291,96 @@ class NavSense:
 
     def _extract_target_object(self, text: str):
         """Resolve the user's requested object to a class name."""
-        normalized = f" {text.lower().strip()} "
+        normalized_text = re.sub(r'[^a-z0-9\s]', ' ', text.lower()).strip()
+        normalized_words = [word[:-1] if word.endswith('s') and len(word) > 3 else word for word in normalized_text.split()]
+        normalized = f" {' '.join(normalized_words)} "
         for class_name, aliases in self.object_aliases.items():
             for alias in aliases:
-                if f" {alias} " in normalized:
+                alias_norm = alias.lower().strip()
+                if f" {alias_norm} " in normalized:
                     return class_name
+        return None
 
-        stopwords = {
-            'where', 'is', 'the', 'a', 'an', 'my', 'find', 'me', 'show', 'locate',
-            'please', 'tell', 'what', 'about', 'nearest'
+    def _strip_wake_words(self, text: str) -> str:
+        """Remove leading wake words without destroying the actual request."""
+        cleaned = re.sub(r'^(hey|hi|hello)\s+', '', text.strip().lower())
+        cleaned = re.sub(r'^jarvis\s+', '', cleaned)
+        cleaned = re.sub(r'^(hey|hi|hello)\s+jarvis\s+', '', cleaned)
+        return cleaned.strip()
+
+    def _is_social_only_command(self, text: str) -> bool:
+        """True only for pure social phrases, not real requests prefixed with a greeting."""
+        social_exact = {
+            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'thank you', 'thanks', 'who are you', 'how are you'
         }
-        words = [word for word in normalized.split() if word not in stopwords]
-        if not words:
-            return None
-        candidate = " ".join(words)
-        return candidate.strip()
+        if text in social_exact:
+            return True
+
+        action_markers = [
+            'where', 'what', 'how many', 'can you', 'do you', 'is there', 'are there',
+            'tell me', 'find', 'locate', 'see', 'show', 'describe', 'explain',
+            'difference', 'properties', 'about'
+        ]
+        if any(marker in text for marker in action_markers):
+            return False
+
+        short_text = self._strip_wake_words(text)
+        return short_text in social_exact
+
+    def _is_count_query(self, text: str) -> bool:
+        """Detect count-style questions."""
+        return any(phrase in text for phrase in ['how many', 'count', 'number of'])
+
+    def _looks_like_general_query(self, text: str) -> bool:
+        """Only send real question-like phrases to Jarvis/LLM."""
+        query_starters = (
+            'what', 'who', 'where', 'when', 'why', 'how', 'tell me', 'explain',
+            'describe', 'can you', 'do you', 'is there', 'are there'
+        )
+        noise_phrases = {'okay', 'ok', 'stop', 'nothing', "that's it", 'thats it'}
+        if text in noise_phrases:
+            return False
+        return text.startswith(query_starters)
+
+    def _handle_count_query(self, text: str) -> bool:
+        """Handle questions like 'how many cars can you see'."""
+        detections = self._get_last_detections_snapshot()
+        object_name = self._extract_target_object(text)
+        if not object_name:
+            return False
+
+        matches = self._find_detection_matches(object_name, detections)
+        count = len(matches)
+        if count == 0:
+            self._speak_and_remember(f"I do not see any {object_name} right now.", priority=True)
+        elif count == 1:
+            self._speak_and_remember(f"I can see 1 {object_name}.", priority=True)
+        else:
+            self._speak_and_remember(f"I can see {count} {object_name}s.", priority=True)
+        return True
+
+    def _handle_visibility_query(self, text: str) -> bool:
+        """Handle yes/no existence checks like 'can you see any cell phone'."""
+        query_markers = ['can you see', 'do you see', 'is there', 'are there', 'any ']
+        if not any(marker in text for marker in query_markers):
+            return False
+
+        detections = self._get_last_detections_snapshot()
+        object_name = self._extract_target_object(text)
+        if not object_name:
+            return False
+
+        matches = self._find_detection_matches(object_name, detections)
+        if matches:
+            closest = min(matches, key=lambda x: x.get('distance', 999))
+            self._speak_and_remember(
+                f"Yes. I found {object_name} {self._describe_detection_location(closest)}.",
+                priority=True
+            )
+        else:
+            self._speak_and_remember(self._build_not_found_response(object_name, detections), priority=True)
+        return True
 
     def _find_detection_matches(self, target_name: str, detections):
         """Find detections matching a resolved class name or free-text target."""
@@ -352,7 +428,7 @@ class NavSense:
         Handle voice commands with keyword + fuzzy matching.
         Mode switching ONLY on short, explicit mode-name phrases.
         """
-        text = text.strip().lower()
+        text = self._strip_wake_words(text.strip().lower())
         if not text or len(text) < 2:
             return
 
@@ -409,6 +485,11 @@ class NavSense:
                 if any(p in text for p in phrases) or mode in words_set:
                     self._set_mode(mode)
                     return
+            self._speak_and_remember(
+                "I did not catch the mode. Please say indoor, outdoor, or jarvis.",
+                priority=True
+            )
+            return
 
         # ── 2. Shutdown ───────────────────────────────────────────────────────
         if any(w in words_set for w in ['shutdown', 'shut', 'exit', 'quit', 'bye']):
@@ -418,7 +499,7 @@ class NavSense:
             return
 
         # ── 3. Social ─────────────────────────────────────────────────────────
-        if any(t in text for t in ['hello', 'hi ', 'hey', 'how are you', 'thank you', 'thanks', 'who are you', 'good morning', 'good afternoon', 'good evening']):
+        if self._is_social_only_command(text):
             self._handle_social_command(text)
             return
 
@@ -441,6 +522,10 @@ class NavSense:
             return
         if any(w in words_set for w in ['safe', 'clear', 'obstacle', 'path', 'walk']):
             self._handle_safety_command()
+            return
+        if self._is_count_query(text) and self._handle_count_query(text):
+            return
+        if self._handle_visibility_query(text):
             return
 
         # ── 7. Scene Scan ─────────────────────────────────────────────────────
@@ -467,9 +552,9 @@ class NavSense:
             return
 
         # ── 9. General Question / Jarvis mode → LLM ──────────────────────────
-        QUESTION_STARTERS = ['what', 'who', 'how', 'tell', 'can you', 'do you', 'is there', 'are there', 'show']
+        QUESTION_STARTERS = ['what', 'who', 'how', 'tell', 'can you', 'do you', 'is there', 'are there', 'show', 'explain', 'describe', 'why']
         is_question = any(text.startswith(q) for q in QUESTION_STARTERS)
-        if self.current_mode == 'jarvis' or is_question:
+        if (self.current_mode == 'jarvis' and self._looks_like_general_query(text)) or is_question:
             self._handle_jarvis_query(text)
             return
 
@@ -510,12 +595,10 @@ class NavSense:
 
     def _handle_jarvis_query(self, text: str):
         """
-        Rule-based query handler. No LLM needed.
-        Scans live detections and replies instantly.
+        Mixed rule-based + LLM query handler.
         """
         detections = self._get_last_detections_snapshot()
         asked_class = self._extract_target_object(text)
-
         if asked_class:
             matches = self._find_detection_matches(asked_class, detections)
             if matches:
@@ -531,6 +614,16 @@ class NavSense:
             else:
                 self._speak_and_remember(self._build_not_found_response(asked_class, detections), priority=True)
             return
+
+        if self.current_mode == 'jarvis' and self._looks_like_general_query(text) and self.llm and self.llm.check_connection():
+            self._llm_busy = True
+            try:
+                response = self.llm.answer_query(text, detections)
+            finally:
+                self._llm_busy = False
+            if response:
+                self._speak_and_remember(response, priority=True)
+                return
 
         if not detections:
             self._speak_and_remember("I do not see anything right now.", priority=True)

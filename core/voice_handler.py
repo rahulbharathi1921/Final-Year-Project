@@ -34,6 +34,7 @@ class VoiceHandler:
         self.tts_thread = None
         self.is_speaking = False
         self._tts_lock = threading.Lock()
+        self._stop_tts_requested = threading.Event()
         # Callbacks & History
         self.command_callback = None
         self.history = []
@@ -79,11 +80,27 @@ class VoiceHandler:
         """Queue text for speaking."""
         if not text: return
         if priority:
+            self.stop_speaking()
             while not self.tts_queue.empty():
                 try: self.tts_queue.get_nowait()
                 except queue.Empty: break
         self.tts_queue.put(text)
         print(f"[TTS] Ready: '{text[:50]}...'")
+
+    def stop_speaking(self):
+        """Interrupt current speech output."""
+        self._stop_tts_requested.set()
+        try:
+            if self.tts_engine_type == 'gtts' and pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        try:
+            if self.tts_engine:
+                self.tts_engine.stop()
+        except Exception:
+            pass
+        self.is_speaking = False
     def _tts_loop(self):
         """Continuous TTS consumer."""
         # 🧵 ON WINDOWS: SAPI5 Must be initialized in the worker thread!
@@ -102,6 +119,7 @@ class VoiceHandler:
             try:
                 text = self.tts_queue.get(timeout=1)
                 self.is_speaking = True
+                self._stop_tts_requested.clear()
                 # Accuracy Revert: Use the engine specified in settings.yaml (gTTS for quality)
                 clean_text = text.replace("%", " percent ").replace("#", " number ").strip()
                 success = False
@@ -124,6 +142,11 @@ class VoiceHandler:
             pygame.mixer.music.load(tmp)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
+                if self._stop_tts_requested.is_set():
+                    pygame.mixer.music.stop()
+                    pygame.mixer.music.unload()
+                    os.remove(tmp)
+                    return True
                 time.sleep(0.1)
             pygame.mixer.music.unload()
             os.remove(tmp)
@@ -154,16 +177,13 @@ class VoiceHandler:
             "mode", "activate", "enter", "where", "what", "who", "how", "find",
             "help", "hello", "hi", "hey", "thank", "thanks", "safe", "clear",
             "walk", "repeat", "again", "scan", "look", "see", "person", "chair",
-            "door", "table", "car", "stop", "go", "exit", "quit", "bye"
+            "door", "table", "car", "cell", "phone", "mobile", "count", "many",
+            "difference", "explain", "about", "llm", "yolo", "model", "stop", "go", "exit", "quit", "bye"
         ]
         
         while self.is_listening:
             try:
                 with self.microphone as source:
-                    if self.is_speaking:
-                        time.sleep(0.2)
-                        continue
-                    
                     audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=self.phrase_limit)
                     wav_data = audio.get_wav_data()
                     
@@ -180,7 +200,14 @@ class VoiceHandler:
                         tf.write(wav_data)
                     
                     try:
-                        segments, _ = self.whisper_model.transcribe(tmp_wav, beam_size=1, language="en")
+                        segments, _ = self.whisper_model.transcribe(
+                            tmp_wav,
+                            beam_size=1,
+                            best_of=1,
+                            language="en",
+                            vad_filter=True,
+                            condition_on_previous_text=False
+                        )
                         text = " ".join([seg.text for seg in segments]).strip()
                         
                         # Clean text and check for keywords
@@ -190,6 +217,8 @@ class VoiceHandler:
                             has_keyword = any(kw in text_clean for kw in COMMAND_KEYWORDS)
                             if has_keyword or len(text_clean) <= 15 or 3 <= len(text_clean) <= 30:
                                 print(f"[VoiceHandler] Heard: '{text}' -> '{text_clean}'")
+                                if self.is_speaking and rms >= 850:
+                                    self.stop_speaking()
                                 if self.command_callback:
                                     self.command_callback(text_clean)
                             else:
