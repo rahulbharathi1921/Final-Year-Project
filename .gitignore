@@ -12,7 +12,7 @@ models/yolov5nu.pt
 
 # Session Logs
 logs/
-
+.openclaude
 # Local System Configuration
 config/settings.yaml
 .env

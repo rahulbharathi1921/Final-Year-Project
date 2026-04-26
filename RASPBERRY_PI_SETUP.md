@@ -1,23 +1,21 @@
 # NavSense Raspberry Pi 5 Setup
 
 This guide is for:
-- Raspberry Pi 5
-- 4GB RAM
+- Raspberry Pi 5 (4GB RAM)
 - Pi Camera Module v1
 - HC-SR04 ultrasonic sensor
 - MPU6050 IMU
 
-Your current hardware layout assumption in the code:
+Your hardware layout assumption in the code:
 - camera centered
-- ultrasonic centered
-- MPU6050 slightly down-left of camera
+- ultrasonic centered (shares forward lane with camera)
+- MPU6050 slightly down-left of camera (orientation reference only)
 
 ## 1. Flash and update Raspberry Pi OS
 
 Use a recent Raspberry Pi OS Bookworm image.
 
 After first boot:
-
 ```bash
 sudo apt update
 sudo apt full-upgrade -y
@@ -27,7 +25,6 @@ sudo reboot
 ## 2. Enable hardware interfaces
 
 Run:
-
 ```bash
 sudo raspi-config
 ```
@@ -37,7 +34,6 @@ Enable:
 - `Interface Options` -> `Camera`
 
 Then reboot:
-
 ```bash
 sudo reboot
 ```
@@ -45,7 +41,6 @@ sudo reboot
 ## 3. Install system packages
 
 Install OS-level dependencies first:
-
 ```bash
 sudo apt update
 sudo apt install -y \
@@ -63,9 +58,9 @@ sudo apt install -y \
 ```
 
 Notes:
-- `python3-picamera2` is the correct way to get Pi camera support on Raspberry Pi OS.
-- `portaudio19-dev` helps `pyaudio` build cleanly.
-- `espeak` is commonly used by `pyttsx3` on Linux.
+- `python3-picamera2` is the correct way to get Pi camera support on Bookworm
+- `portaudio19-dev` helps `pyaudio` build cleanly
+- `espeak` is used by `pyttsx3` on Linux
 
 ## 4. Clone the repo
 
@@ -85,17 +80,20 @@ python -m pip install --upgrade pip setuptools wheel
 ## 6. Install Python dependencies
 
 Install shared + Pi-specific packages:
-
 ```bash
 python -m pip install -r requirements.txt -r requirements-pi.txt
 ```
 
-If `pyaudio` fails, confirm `portaudio19-dev` is installed and retry.
+If `pyaudio` fails, confirm `portaudio19-dev` is installed and retry:
+```bash
+python -m pip install pyaudio
+```
+
+Note: On Pi, `torch`/`torchvision` should be installed separately only after validating available wheels for your exact OS. The codebase uses `ultralytics` which handles its own model loading.
 
 ## 7. Configure Gemini key
 
 Create `.env` in the repo root:
-
 ```env
 GEMINI_API_KEY="your_key_here"
 ```
@@ -103,13 +101,11 @@ GEMINI_API_KEY="your_key_here"
 ## 8. Verify camera and I2C
 
 Check Pi camera:
-
 ```bash
 libcamera-hello
 ```
 
 Check I2C device list:
-
 ```bash
 i2cdetect -y 1
 ```
@@ -121,10 +117,8 @@ You should normally see MPU6050 at `0x68`.
 ### HC-SR04
 - `VCC` -> 5V
 - `GND` -> GND
-- `TRIG` -> GPIO23
-- `ECHO` -> GPIO24 through voltage divider
-
-Your voltage divider on `ECHO` is correct and required.
+- `TRIG` -> GPIO23 (BCM numbering)
+- `ECHO` -> GPIO24 through voltage divider (required, do not skip)
 
 ### MPU6050
 - `VCC` -> 3.3V
@@ -132,55 +126,41 @@ Your voltage divider on `ECHO` is correct and required.
 - `SDA` -> GPIO2 / SDA
 - `SCL` -> GPIO3 / SCL
 
-## 10. Switch config to Raspberry Pi mode
+## 10. Run with Pi config profile
 
-Edit `config/settings.yaml`:
-
-```yaml
-platform:
-  target: "raspberry_pi"
-  headless: true
-
-camera:
-  backend: "picamera2"
-
-display:
-  show_window: false
-
-sensors:
-  ultrasonic:
-    enabled: true
-  imu:
-    enabled: true
-```
-
-Recommended Pi tuning:
-
-```yaml
-camera:
-  width: 640
-  height: 480
-  fps_target: 15
-
-voice:
-  model_size: "tiny.en"
-```
-
-Reason:
-- Pi 5 can run more than this, but `tiny.en` and lower FPS will give better real-time behavior.
-
-## 11. First run
-
-Run:
+Do NOT edit config files manually. Use the `--config` flag:
 
 ```bash
+python main.py --config config/settings.pi.yaml
+```
+
+Or set the environment variable:
+```bash
+export NAVSENSE_CONFIG=config/settings.pi.yaml
 python main.py
 ```
 
-## 12. If object detection is slow
+This selects the correct settings:
+- `camera.backend: "picamera2"`
+- `sensors.ultrasonic.enabled: true`
+- `sensors.imu.enabled: true`
+- `display.show_window: false`
+- `voice.model_size: "tiny.en"`
+- `camera.fps_target: 15`
 
-Try these changes in `config/settings.yaml`:
+## 11. Recommended bring-up order
 
+Do not debug everything at once:
+
+1. camera only (run with display or check logs for frame output)
+2. ultrasonic only (check logs for distance readings)
+3. MPU6050 only (check logs for pitch/roll values)
+4. voice only (test `tiny.en` model)
+5. full NavSense
+
+## 12. Tuning for your setup
+
+If object detection is slow, adjust `settings.pi.yaml`:
 ```yaml
 camera:
   fps_target: 12
@@ -192,26 +172,22 @@ voice:
   model_size: "tiny.en"
 ```
 
-If PyTorch/YOLO is still too heavy on the Pi image you use:
-- test the camera + voice + sensors first
-- then install a Pi-compatible PyTorch wheel for your OS
+If PyTorch/YOLO is too heavy:
+- test camera + voice + sensors first
+- then install a Pi-compatible PyTorch wheel if needed
 
-## 13. Recommended bring-up order
+## 13. Calibration steps (after first successful run)
 
-Do not debug everything at once.
-
-1. camera only
-2. ultrasonic only
-3. MPU6050 only
-4. voice only
-5. full NavSense
+1. Calibrate `distance.focal_length` (default 615.0) with known-distance objects
+2. Tune `sensors.ultrasonic.offset_m` (default 0.0) for your mount
+3. Verify MPU6050 pitch/roll orientation sign conventions
+4. Retune voice RMS thresholds for your mic/speaker setup
 
 ## 14. Common issues
 
 ### `picamera2` import fails
 
 Install:
-
 ```bash
 sudo apt install -y python3-picamera2 python3-libcamera
 ```
@@ -219,13 +195,11 @@ sudo apt install -y python3-picamera2 python3-libcamera
 ### `pyaudio` build fails
 
 Install:
-
 ```bash
 sudo apt install -y portaudio19-dev
 ```
 
 Then retry:
-
 ```bash
 python -m pip install pyaudio
 ```
@@ -233,40 +207,46 @@ python -m pip install pyaudio
 ### IMU not detected
 
 Check:
-
 ```bash
 i2cdetect -y 1
 ```
 
 If `0x68` is missing:
 - recheck SDA/SCL wiring
-- confirm I2C is enabled
+- confirm I2C is enabled in `raspi-config`
 - confirm module power and ground
 
 ### Ultrasonic always reads zero or max
 
 Check:
-- voltage divider on `ECHO`
+- voltage divider on `ECHO` (required!)
 - ground connection
-- TRIG/ECHO pin numbers match config
+- TRIG/ECHO pin numbers match config (BCM numbering: 23/24)
 
 ### App runs but no display
 
-This is expected in Pi headless mode:
+This is expected in Pi headless mode with `show_window: false`. Voice-first mode is the intended Pi deployment path.
 
-```yaml
-platform:
-  headless: true
-display:
-  show_window: false
+Check logs for confirmation:
+```bash
+tail -f logs/session_*/session.log
 ```
 
-Voice-first mode is the intended Pi deployment path.
+## 15. Hardware layout verification
 
-## 15. Recommended next calibration
+The Pi config (`settings.pi.yaml`) defines:
+```yaml
+sensors:
+  ultrasonic:
+    mount_position: "center"
+  imu:
+    mount_position: "down_left_of_camera"
+  fusion:
+    layout_note: "camera_centered_ultrasonic_centered_imu_down_left"
+    primary_forward_sensor: "ultrasonic"
+```
 
-After the first successful run:
-- calibrate `distance.focal_length`
-- tune `sensors.ultrasonic.offset_m`
-- verify MPU6050 pitch/roll orientation
-- retune voice thresholds for your mic/speaker setup
+Interpretation:
+- camera and ultrasonic share the forward lane
+- MPU6050 is orientation reference only — its physical offset should NOT be treated as obstacle position
+- ultrasonic is authoritative for forward close-range obstacle detection (≤0.8m triggers high-priority alert)
