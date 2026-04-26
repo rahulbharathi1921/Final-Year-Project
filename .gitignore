@@ -15,3 +15,4 @@ logs/
 
 # Local System Configuration
 config/settings.yaml
+.env
