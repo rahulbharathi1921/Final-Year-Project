@@ -211,7 +211,6 @@
     ],
     "danger_categories": {
         "immediate": [
-            "stairs",
             "car",
             "bus",
             "truck",

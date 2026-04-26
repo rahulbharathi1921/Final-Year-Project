@@ -200,8 +200,11 @@ class NavSense:
         self.is_running = True
         
         # Priority startup greeting
-        self._speak_and_remember(f"Hello {self.user_name}! Navsense is active and 100 percent offline.", priority=True)
-        self._speak_and_remember(f"Hello {self.user_name}! NavSense is active. Which mode do you want to activate now?: indoor, outdoor, or jarvis?", priority=True)
+        self._speak_and_remember(
+            f"Hello {self.user_name}! NavSense is active and 100 percent offline. "
+            f"Which mode do you want: indoor, outdoor, or jarvis?",
+            priority=True
+        )
         
         # Optional: Short wait for the very first greeting, but much shorter than 10s
         self.voice.wait_until_done_speaking(timeout=6.0)
@@ -359,6 +362,20 @@ class NavSense:
     def _is_count_query(self, text: str) -> bool:
         """Detect count-style questions."""
         return any(phrase in text for phrase in ['how many', 'count', 'number of'])
+
+    def _has_object_query_intent(self, text: str) -> bool:
+        """Require clear user intent before legacy object-specific handlers run."""
+        intent_phrases = (
+            'where', 'find', 'locate', 'location', 'how many', 'count',
+            'can you see', 'do you see', 'is there', 'are there',
+            'tell me', 'describe', 'what is', 'what are', 'scan',
+            'track', 'follow'
+        )
+        if any(phrase in text for phrase in intent_phrases):
+            return True
+
+        words = text.split()
+        return len(words) <= 2
 
     def _looks_like_general_query(self, text: str) -> bool:
         """Only send real question-like phrases to Jarvis/LLM."""
@@ -999,19 +1016,19 @@ class NavSense:
 
 
         # ── 8. Object Queries ─────────────────────────────────────────────────
-        if any(w in words_set for w in ['person', 'people', 'human', 'man', 'woman', 'child', 'anyone', 'someone', 'crowd']):
+        if self._has_object_query_intent(text) and any(w in words_set for w in ['person', 'people', 'human', 'man', 'woman', 'child', 'anyone', 'someone', 'crowd']):
             self._handle_person_command()
             return
-        if any(w in words_set for w in ['chair', 'seat', 'bench', 'stool', 'sofa', 'couch']):
+        if self._has_object_query_intent(text) and any(w in words_set for w in ['chair', 'seat', 'bench', 'stool', 'sofa', 'couch']):
             self._handle_chair_command()
             return
-        if any(w in words_set for w in ['door', 'doorway', 'entrance', 'exit', 'gate']):
+        if self._has_object_query_intent(text) and any(w in words_set for w in ['door', 'doorway', 'entrance', 'gate']):
             self._handle_door_command()
             return
-        if any(w in words_set for w in ['wall', 'barrier', 'obstacle']):
+        if self._has_object_query_intent(text) and any(w in words_set for w in ['wall', 'barrier', 'obstacle']):
             self._handle_wall_command()
             return
-        if any(w in words_set for w in ['laptop', 'tv', 'screen', 'monitor', 'computer', 'television']):
+        if self._has_object_query_intent(text) and any(w in words_set for w in ['laptop', 'tv', 'screen', 'monitor', 'computer', 'television']):
             self._handle_tv_laptop_command()
             return
 

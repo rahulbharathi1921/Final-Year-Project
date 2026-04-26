@@ -6,6 +6,7 @@ Basic frame-to-frame tracking using centroid matching.
 import numpy as np
 from typing import List, Dict, Any, Tuple
 from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
 
 
 class SimpleTracker:
@@ -132,37 +133,45 @@ class SimpleTracker:
             for det in detections
         ])
         
-        # Calculate distance matrix
+        # Calculate global assignment cost matrix.
         distances = cdist(object_centroids, detection_centroids)
+        costs = np.full(distances.shape, np.inf, dtype=float)
+        for obj_idx, object_id in enumerate(object_ids):
+            previous_state = self.objects[object_id]
+            previous_class = previous_state.get('class_name') or previous_state.get('class')
+            previous_bbox = previous_state.get('bbox')
+            for det_idx, det in enumerate(detections):
+                distance = distances[obj_idx, det_idx]
+                if distance > self.max_distance:
+                    continue
+
+                current_class = det.get('class_name') or det.get('class')
+                class_penalty = 35.0 if previous_class and current_class and previous_class != current_class else 0.0
+                iou = self._calculate_iou(previous_bbox, det['bbox']) if previous_bbox else 0.0
+                costs[obj_idx, det_idx] = distance + class_penalty - (iou * 30.0)
         
         # Find best matches
         matched_objects = set()
         matched_detections = set()
         tracked_detections = []
-        
-        # Greedy matching - find closest pairs
-        while distances.size > 0 and distances.min() < self.max_distance:
-            min_idx = np.argmin(distances)
-            obj_idx = min_idx // distances.shape[1]
-            det_idx = min_idx % distances.shape[1]
-            
-            # Match found
-            object_id = object_ids[obj_idx]
-            matched_objects.add(object_id)
-            matched_detections.add(det_idx)
-            
-            # Update tracked object
-            previous_state = self.objects.get(object_id)
-            track_state = self._build_track_state(detections[det_idx], object_id, previous_state)
-            self.objects[object_id] = track_state
-            if object_id in self.disappeared:
-                del self.disappeared[object_id]
-            
-            tracked_detections.append(track_state.copy())
-            
-            # Remove from distance matrix
-            distances[obj_idx, :] = np.inf
-            distances[:, det_idx] = np.inf
+
+        if costs.size > 0 and np.isfinite(costs).any():
+            row_indices, col_indices = linear_sum_assignment(np.where(np.isfinite(costs), costs, 1e9))
+            for obj_idx, det_idx in zip(row_indices, col_indices):
+                if not np.isfinite(costs[obj_idx, det_idx]):
+                    continue
+
+                object_id = object_ids[obj_idx]
+                matched_objects.add(object_id)
+                matched_detections.add(det_idx)
+
+                previous_state = self.objects.get(object_id)
+                track_state = self._build_track_state(detections[det_idx], object_id, previous_state)
+                self.objects[object_id] = track_state
+                if object_id in self.disappeared:
+                    del self.disappeared[object_id]
+
+                tracked_detections.append(track_state.copy())
         
         # Handle unmatched objects (disappeared)
         for i, object_id in enumerate(object_ids):

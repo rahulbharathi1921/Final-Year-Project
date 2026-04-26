@@ -10,6 +10,7 @@ import queue
 import time
 import os
 import tempfile
+from collections import deque
 import pygame
 from gtts import gTTS
 import pyttsx3
@@ -39,6 +40,7 @@ class VoiceHandler:
         self._last_tts_text = ""
         self._last_tts_started_at = 0.0
         self._last_tts_finished_at = 0.0
+        self._recent_tts_texts = deque(maxlen=4)
         # Callbacks & History
         self.command_callback = None
         self.history = []
@@ -48,7 +50,8 @@ class VoiceHandler:
         self.tts_rate = tts_config.get('rate', 150)
         self.min_listen_rms = int(voice_config.get('min_rms', 500))
         self.barge_in_rms_threshold = int(voice_config.get('barge_in_rms_threshold', 1400))
-        self.echo_guard_seconds = float(voice_config.get('echo_guard_seconds', 1.4))
+        self.echo_guard_seconds = float(voice_config.get('echo_guard_seconds', 2.2))
+        self.post_tts_rms_threshold = int(voice_config.get('post_tts_rms_threshold', 1050))
         print(f"[VoiceHandler] Whisper model selected: {self.whisper_model_size}")
     def initialize(self) -> bool:
         """Initialize all voice components."""
@@ -109,30 +112,82 @@ class VoiceHandler:
         )
         return any(phrase in text for phrase in interrupt_phrases)
 
+    def _looks_like_user_request(self, text: str) -> bool:
+        """Heuristic gate for low-volume audio immediately after TTS."""
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+
+        short_commands = {
+            'indoor', 'outdoor', 'jarvis', 'stop', 'quiet', 'pause',
+            'resume', 'help', 'scan', 'repeat', 'track', 'follow'
+        }
+        if normalized in short_commands:
+            return True
+
+        request_starters = (
+            'hey', 'jarvis', 'where', 'what', 'who', 'how', 'can you',
+            'could you', 'do you', 'is there', 'are there', 'tell me',
+            'describe', 'find', 'locate', 'which', 'switch to',
+            'change to', 'activate', 'enter'
+        )
+        return normalized.startswith(request_starters)
+
+    def _looks_like_assistant_speech(self, text: str) -> bool:
+        """Detect common NavSense response patterns so speaker bleed is ignored."""
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+
+        assistant_starters = (
+            'i can see', 'i do not see', 'i don t see', 'i found',
+            'the person is', 'the cell phone is', 'the center path',
+            'the left side', 'the right side', 'sir i detect',
+            'sir i have', 'warning', 'caution', 'scanning environment',
+            'jarvis mode active', 'indoor mode activated', 'outdoor mode activated',
+            'hello joe', 'i will help you navigate', 'please say indoor',
+            'shutting down navsense'
+        )
+        if normalized.startswith(assistant_starters):
+            return True
+
+        assistant_fragments = (
+            'meters in the center', 'meters on your left', 'meters on your right',
+            'path is clear', 'looks safe', 'currently see', 'directly in your',
+            'objects in total'
+        )
+        return any(fragment in normalized for fragment in assistant_fragments)
+
     def _is_recent_tts_echo(self, text: str) -> bool:
         """Filter recognitions that are likely NavSense hearing its own speech."""
         candidate = self._normalize_text(text)
-        spoken = self._normalize_text(self._last_tts_text)
-        if not candidate or not spoken:
+        if not candidate:
             return False
 
         recent_tts = self.is_speaking or (time.time() - self._last_tts_finished_at) <= self.echo_guard_seconds
         if not recent_tts:
             return False
 
-        if candidate == spoken:
-            return True
-        if len(candidate) >= 12 and (candidate in spoken or spoken in candidate):
-            return True
-
-        candidate_tokens = set(candidate.split())
-        spoken_tokens = set(spoken.split())
-        if candidate_tokens and spoken_tokens:
-            overlap = len(candidate_tokens & spoken_tokens) / max(1, min(len(candidate_tokens), len(spoken_tokens)))
-            if overlap >= 0.75:
+        for spoken_raw in [self._last_tts_text, *self._recent_tts_texts]:
+            spoken = self._normalize_text(spoken_raw)
+            if not spoken:
+                continue
+            if candidate == spoken:
+                return True
+            if len(candidate) >= 10 and (candidate in spoken or spoken in candidate):
                 return True
 
-        return difflib.SequenceMatcher(None, candidate, spoken).ratio() >= 0.72
+            candidate_tokens = set(candidate.split())
+            spoken_tokens = set(spoken.split())
+            if candidate_tokens and spoken_tokens:
+                overlap = len(candidate_tokens & spoken_tokens) / max(1, min(len(candidate_tokens), len(spoken_tokens)))
+                if overlap >= 0.7:
+                    return True
+
+            if difflib.SequenceMatcher(None, candidate, spoken).ratio() >= 0.7:
+                return True
+
+        return False
 
     def stop_speaking(self):
         """Interrupt current speech output."""
@@ -170,6 +225,7 @@ class VoiceHandler:
                 # Accuracy Revert: Use the engine specified in settings.yaml (gTTS for quality)
                 clean_text = text.replace("%", " percent ").replace("#", " number ").strip()
                 self._last_tts_text = clean_text
+                self._recent_tts_texts.append(clean_text)
                 self._last_tts_started_at = time.time()
                 success = False
                 if self.tts_engine_type == 'gtts':
@@ -275,6 +331,16 @@ class VoiceHandler:
                             if self.is_speaking and rms < self.barge_in_rms_threshold and not self._is_interrupt_command(text_clean):
                                 print(f"[VoiceHandler] Ignored during TTS (likely speaker bleed): '{text_clean}'")
                                 continue
+
+                            recent_tts_window = (time.time() - self._last_tts_finished_at) <= self.echo_guard_seconds
+                            if recent_tts_window and self._looks_like_assistant_speech(text_clean):
+                                print(f"[VoiceHandler] Ignored assistant-style bleed: '{text_clean}'")
+                                continue
+
+                            if recent_tts_window and rms < self.post_tts_rms_threshold and not self._is_interrupt_command(text_clean):
+                                if not self._looks_like_user_request(text_clean):
+                                    print(f"[VoiceHandler] Ignored post-TTS bleed: '{text_clean}'")
+                                    continue
 
                             has_keyword = any(kw in text_clean for kw in COMMAND_KEYWORDS)
                             if has_keyword or len(text_clean) <= 15 or 3 <= len(text_clean) <= 30:
