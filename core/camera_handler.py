@@ -151,8 +151,7 @@ class CameraHandler:
     def __del__(self):
         """Destructor to ensure camera is released."""
         self.release()
-
-
+        
 def test_camera():
     """Test function for camera handler."""
     import yaml
