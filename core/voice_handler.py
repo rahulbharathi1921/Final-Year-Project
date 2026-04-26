@@ -3,6 +3,7 @@ Voice Handler Module
 Manages speech recognition (Whisper) and text-to-speech (gTTS/pyttsx3).
 """
 import re
+import difflib
 import speech_recognition as sr
 import threading
 import queue
@@ -35,6 +36,9 @@ class VoiceHandler:
         self.is_speaking = False
         self._tts_lock = threading.Lock()
         self._stop_tts_requested = threading.Event()
+        self._last_tts_text = ""
+        self._last_tts_started_at = 0.0
+        self._last_tts_finished_at = 0.0
         # Callbacks & History
         self.command_callback = None
         self.history = []
@@ -42,6 +46,9 @@ class VoiceHandler:
         self.language = voice_config.get('language', 'en-US')
         self.phrase_limit = voice_config.get('phrase_time_limit', 5)
         self.tts_rate = tts_config.get('rate', 150)
+        self.min_listen_rms = int(voice_config.get('min_rms', 500))
+        self.barge_in_rms_threshold = int(voice_config.get('barge_in_rms_threshold', 1400))
+        self.echo_guard_seconds = float(voice_config.get('echo_guard_seconds', 1.4))
         print(f"[VoiceHandler] Whisper model selected: {self.whisper_model_size}")
     def initialize(self) -> bool:
         """Initialize all voice components."""
@@ -87,6 +94,46 @@ class VoiceHandler:
         self.tts_queue.put(text)
         print(f"[TTS] Ready: '{text[:50]}...'")
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize text for echo suppression and command matching."""
+        text = re.sub(r'[^a-z0-9\s]', ' ', str(text).lower())
+        return " ".join(text.split())
+
+    def _is_interrupt_command(self, text: str) -> bool:
+        """Commands that are allowed to interrupt active TTS."""
+        interrupt_phrases = (
+            'stop', 'quiet', 'pause', 'be quiet', 'stop talking',
+            'resume', 'continue speaking', 'repeat last', 'repeat that',
+            'say that again', 'mute alerts', 'stop alerts', 'silence alerts'
+        )
+        return any(phrase in text for phrase in interrupt_phrases)
+
+    def _is_recent_tts_echo(self, text: str) -> bool:
+        """Filter recognitions that are likely NavSense hearing its own speech."""
+        candidate = self._normalize_text(text)
+        spoken = self._normalize_text(self._last_tts_text)
+        if not candidate or not spoken:
+            return False
+
+        recent_tts = self.is_speaking or (time.time() - self._last_tts_finished_at) <= self.echo_guard_seconds
+        if not recent_tts:
+            return False
+
+        if candidate == spoken:
+            return True
+        if len(candidate) >= 12 and (candidate in spoken or spoken in candidate):
+            return True
+
+        candidate_tokens = set(candidate.split())
+        spoken_tokens = set(spoken.split())
+        if candidate_tokens and spoken_tokens:
+            overlap = len(candidate_tokens & spoken_tokens) / max(1, min(len(candidate_tokens), len(spoken_tokens)))
+            if overlap >= 0.75:
+                return True
+
+        return difflib.SequenceMatcher(None, candidate, spoken).ratio() >= 0.72
+
     def stop_speaking(self):
         """Interrupt current speech output."""
         self._stop_tts_requested.set()
@@ -122,17 +169,21 @@ class VoiceHandler:
                 self._stop_tts_requested.clear()
                 # Accuracy Revert: Use the engine specified in settings.yaml (gTTS for quality)
                 clean_text = text.replace("%", " percent ").replace("#", " number ").strip()
+                self._last_tts_text = clean_text
+                self._last_tts_started_at = time.time()
                 success = False
                 if self.tts_engine_type == 'gtts':
                     success = self._speak_gtts(clean_text)
                 if not success: # Fallback to offline
                     self._speak_pyttsx3(clean_text)
                 self.is_speaking = False
+                self._last_tts_finished_at = time.time()
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"[TTS] Loop error: {e}")
                 self.is_speaking = False
+                self._last_tts_finished_at = time.time()
     def _speak_gtts(self, text: str) -> bool:
         try:
             tts = gTTS(text=text, lang=self.language.split('-')[0])
@@ -178,7 +229,10 @@ class VoiceHandler:
             "help", "hello", "hi", "hey", "thank", "thanks", "safe", "clear",
             "walk", "repeat", "again", "scan", "look", "see", "person", "chair",
             "door", "table", "car", "cell", "phone", "mobile", "count", "many",
-            "difference", "explain", "about", "llm", "yolo", "model", "stop", "go", "exit", "quit", "bye"
+            "difference", "explain", "about", "llm", "yolo", "model", "stop", "pause",
+            "resume", "quiet", "mute", "alert", "closest", "nearest", "left", "right",
+            "center", "track", "follow", "direction", "distance", "brief", "detailed",
+            "path", "safer", "side", "clear", "go", "exit", "quit", "bye"
         ]
         
         while self.is_listening:
@@ -189,7 +243,7 @@ class VoiceHandler:
                     
                     # Lower threshold to capture softer speech
                     rms = audioop.rms(wav_data, 2)
-                    if rms < 500:
+                    if rms < self.min_listen_rms:
                         print(f"[VoiceHandler] Audio too quiet (rms={rms}), listening again...")
                         continue
                     
@@ -211,13 +265,21 @@ class VoiceHandler:
                         text = " ".join([seg.text for seg in segments]).strip()
                         
                         # Clean text and check for keywords
-                        text_clean = text.replace(".", "").replace(",", "").replace("?", "").strip().lower()
+                        text_clean = self._normalize_text(text)
                         
                         if text_clean and len(text_clean) > 1:
+                            if self._is_recent_tts_echo(text_clean):
+                                print(f"[VoiceHandler] Ignored self-echo: '{text_clean}'")
+                                continue
+
+                            if self.is_speaking and rms < self.barge_in_rms_threshold and not self._is_interrupt_command(text_clean):
+                                print(f"[VoiceHandler] Ignored during TTS (likely speaker bleed): '{text_clean}'")
+                                continue
+
                             has_keyword = any(kw in text_clean for kw in COMMAND_KEYWORDS)
                             if has_keyword or len(text_clean) <= 15 or 3 <= len(text_clean) <= 30:
                                 print(f"[VoiceHandler] Heard: '{text}' -> '{text_clean}'")
-                                if self.is_speaking and rms >= 850:
+                                if self.is_speaking and rms >= self.barge_in_rms_threshold:
                                     self.stop_speaking()
                                 if self.command_callback:
                                     self.command_callback(text_clean)
@@ -237,7 +299,7 @@ class VoiceHandler:
     def is_currently_speaking(self): return self.is_speaking
     def wait_until_done_speaking(self, timeout=10):
         start = time.time()
-        while self.is_speaking and (time.time() - start) < timeout:
+        while (self.is_speaking or not self.tts_queue.empty()) and (time.time() - start) < timeout:
             time.sleep(0.1)
     def shutdown(self):
         self.is_listening = False

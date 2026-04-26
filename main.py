@@ -69,6 +69,16 @@ class NavSense:
         # Assistant Memory & Context
         self.last_voice_report = ""
         self.assistant_history = []
+        self.last_referenced_object = None
+        self.response_mode = "brief"
+        self.speech_paused = False
+        self.alerts_muted = False
+        self.tracking_target_class = None
+        self.tracking_target_id = None
+        self._tracking_last_zone = None
+        self._tracking_last_distance = None
+        self._tracking_last_seen_frame = None
+        self._tracking_last_announce_time = 0.0
         
         # Load Voice Vocabulary (Massive Dictionary)
         self.voice_vocab = {}
@@ -194,7 +204,7 @@ class NavSense:
         self._speak_and_remember(f"Hello {self.user_name}! NavSense is active. Which mode do you want to activate now?: indoor, outdoor, or jarvis?", priority=True)
         
         # Optional: Short wait for the very first greeting, but much shorter than 10s
-        self.voice.wait_until_done_speaking(timeout=2.0)
+        self.voice.wait_until_done_speaking(timeout=6.0)
         time.sleep(0.1)
         
         # Start voice listening
@@ -213,13 +223,15 @@ class NavSense:
         with self._detections_lock:
             return list(self.last_detections)
     
-    def _speak_and_remember(self, text: str, priority: bool = False):
+    def _speak_and_remember(self, text: str, priority: bool = False, bypass_pause: bool = False):
         """Speak text and store it in memory for the 'Repeat' command."""
         if not text:
             return
         self.last_voice_report = text
         if self.session_logger:
             self.session_logger.log_response(text, mode=self.current_mode, source="navsense", priority=priority)
+        if self.speech_paused and not bypass_pause:
+            return
         self.voice.speak(text, priority=priority)
 
     def _fuzzy_match(self, text: str, keywords: list) -> bool:
@@ -304,6 +316,19 @@ class NavSense:
                     return class_name
         return None
 
+    def _resolve_query_target_object(self, text: str):
+        """Resolve explicit object names or pronoun-based follow-up references."""
+        explicit = self._extract_target_object(text)
+        if explicit:
+            self.last_referenced_object = explicit
+            return explicit
+
+        pronoun_markers = {'it', 'they', 'them', 'that', 'those', 'one', 'ones'}
+        tokens = set(re.sub(r'[^a-z0-9\s]', ' ', text.lower()).split())
+        if self.last_referenced_object and pronoun_markers.intersection(tokens):
+            return self.last_referenced_object
+        return None
+
     def _strip_wake_words(self, text: str) -> str:
         """Remove leading wake words without destroying the actual request."""
         cleaned = re.sub(r'^(hey|hi|hello)\s+', '', text.strip().lower())
@@ -354,21 +379,98 @@ class NavSense:
         )
         return any(phrase in text for phrase in scene_phrases)
 
+    def _is_detailed_detection_query(self, text: str) -> bool:
+        """Detect requests asking for all visible objects with details."""
+        detail_markers = (
+            'what are the objects', 'all objects', 'all detections', 'what objects',
+            'objects can you', 'object name', 'directions', 'direction', 'distance',
+            'their location', 'the locations', 'where are the objects'
+        )
+        return any(marker in text for marker in detail_markers)
+
+    def _build_detection_report(self, detections, include_distance: bool = True) -> str:
+        """Build a deterministic multi-object report from current detections."""
+        if not detections:
+            return "I do not see anything right now."
+
+        ordered = sorted(detections, key=lambda item: (item.get('distance', 999), item.get('class_name', 'object')))
+        total_count = len(ordered)
+
+        # For crowded scenes, summarize by class and zone instead of listing every instance.
+        if total_count > 6 and not (self.response_mode == "detailed" and total_count <= 10):
+            class_groups = {}
+            for det in ordered:
+                class_name = det.get('class_name', det.get('class', 'object'))
+                class_groups.setdefault(class_name, []).append(det)
+
+            summary_parts = []
+            for class_name, items in sorted(class_groups.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+                zone_counts = {'left': 0, 'center': 0, 'right': 0}
+                nearest = min(items, key=lambda item: item.get('distance', 999))
+                for item in items:
+                    zone_counts[item.get('zone', 'center')] += 1
+
+                zone_parts = []
+                for zone in ['left', 'center', 'right']:
+                    count = zone_counts[zone]
+                    if count:
+                        zone_parts.append(f"{count} on your {zone}")
+
+                count_text = f"{len(items)} {class_name}"
+                if len(items) > 1:
+                    count_text += "s"
+
+                if include_distance:
+                    summary_parts.append(
+                        f"{count_text}, nearest at {nearest.get('distance', 0):.1f} meters, " + ", ".join(zone_parts)
+                    )
+                else:
+                    summary_parts.append(f"{count_text}, " + ", ".join(zone_parts))
+
+            return (
+                f"I detect {total_count} objects in total. " +
+                ". ".join(summary_parts[:6]) +
+                "."
+            )
+
+        parts = []
+        for det in ordered:
+            class_name = det.get('class_name', det.get('class', 'object'))
+            zone = det.get('zone', 'center')
+            if zone == 'left':
+                direction = "left side"
+            elif zone == 'right':
+                direction = "right side"
+            else:
+                direction = "center"
+
+            if include_distance:
+                parts.append(f"{class_name} at {det.get('distance', 0):.1f} meters on your {direction}")
+            else:
+                parts.append(f"{class_name} on your {direction}")
+
+        prefix = f"I detect {total_count} object{'s' if total_count != 1 else ''}: "
+        return prefix + ". ".join(parts) + "."
+
     def _handle_count_query(self, text: str) -> bool:
         """Handle questions like 'how many cars can you see'."""
         detections = self._get_last_detections_snapshot()
-        object_name = self._extract_target_object(text)
+        object_name = self._resolve_query_target_object(text)
         if not object_name:
             return False
 
         matches = self._find_detection_matches(object_name, detections)
+        zone_filter = self._extract_zone_filter(text)
+        if zone_filter:
+            matches = [item for item in matches if item.get('zone') == zone_filter]
         count = len(matches)
+        zone_text = f" on your {zone_filter}" if zone_filter else ""
         if count == 0:
-            self._speak_and_remember(f"I do not see any {object_name} right now.", priority=True)
+            self._speak_and_remember(f"I do not see any {object_name}{zone_text} right now.", priority=True)
         elif count == 1:
-            self._speak_and_remember(f"I can see 1 {object_name}.", priority=True)
+            self._speak_and_remember(f"I can see 1 {object_name}{zone_text}.", priority=True)
         else:
-            self._speak_and_remember(f"I can see {count} {object_name}s.", priority=True)
+            self._speak_and_remember(f"I can see {count} {object_name}s{zone_text}.", priority=True)
         return True
 
     def _handle_visibility_query(self, text: str) -> bool:
@@ -378,7 +480,7 @@ class NavSense:
             return False
 
         detections = self._get_last_detections_snapshot()
-        object_name = self._extract_target_object(text)
+        object_name = self._resolve_query_target_object(text)
         if not object_name:
             return False
 
@@ -410,6 +512,318 @@ class NavSense:
             if any(alias == class_name or alias == raw_name or alias in class_name for alias in aliases):
                 matches.append(det)
         return matches
+
+    def _extract_zone_filter(self, text: str):
+        """Extract a requested left/center/right zone from natural language."""
+        lowered = text.lower()
+        if any(phrase in lowered for phrase in ['left side', 'on the left', 'to the left', 'your left']):
+            return 'left'
+        if any(phrase in lowered for phrase in ['right side', 'on the right', 'to the right', 'your right']):
+            return 'right'
+        if any(phrase in lowered for phrase in ['in the center', 'straight ahead', 'middle', 'center']):
+            return 'center'
+        return None
+
+    def _format_zone_phrase(self, zone: str) -> str:
+        """Human-friendly zone phrase."""
+        if zone == 'left':
+            return "on your left side"
+        if zone == 'right':
+            return "on your right side"
+        return "in the center"
+
+    def _get_zone_candidates(self, detections, zone: str | None):
+        """Return detections optionally filtered to a zone."""
+        if not zone:
+            return list(detections)
+        return [det for det in detections if det.get('zone') == zone]
+
+    def _get_closest_detection(self, detections, zone: str | None = None):
+        """Return nearest detection, optionally in a specific zone."""
+        candidates = self._get_zone_candidates(detections, zone)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item.get('distance', 999))
+
+    def _compute_zone_hazard_scores(self, detections):
+        """Score left/center/right danger using proximity and count."""
+        scores = {'left': 0.0, 'center': 0.0, 'right': 0.0}
+        for zone in scores:
+            zone_items = [det for det in detections if det.get('zone') == zone]
+            if not zone_items:
+                continue
+            nearest = min(zone_items, key=lambda item: item.get('distance', 999))
+            nearest_distance = max(0.2, float(nearest.get('distance', 5.0)))
+            scores[zone] = len(zone_items) * 1.5 + (3.5 / nearest_distance)
+            if zone == 'center':
+                scores[zone] += 1.0
+        return scores
+
+    def _handle_pause_speech_command(self):
+        """Pause spoken responses until resumed."""
+        self.speech_paused = True
+        self.voice.stop_speaking()
+
+    def _handle_resume_command(self):
+        """Resume spoken responses and alerts."""
+        self.speech_paused = False
+        self.alerts_muted = False
+        self._speak_and_remember("Speech and alerts resumed.", priority=True, bypass_pause=True)
+
+    def _handle_stop_command(self):
+        """Immediate stop of current speech without shutting down the app."""
+        self.voice.stop_speaking()
+
+    def _handle_mute_alerts_command(self):
+        """Disable automatic alert speech while keeping query responses active."""
+        self.alerts_muted = True
+        self._speak_and_remember("Automatic alerts muted.", priority=True, bypass_pause=True)
+
+    def _handle_response_mode_command(self, mode: str):
+        """Switch between brief and detailed reporting."""
+        self.response_mode = mode
+        self._speak_and_remember(f"{mode.capitalize()} mode activated.", priority=True, bypass_pause=True)
+
+    def _handle_track_command(self, text: str) -> bool:
+        """Begin tracking the nearest requested object."""
+        if not any(marker in text for marker in ['track', 'follow']):
+            return False
+        object_name = self._resolve_query_target_object(text)
+        if not object_name:
+            return False
+        detections = self._get_last_detections_snapshot()
+        matches = self._find_detection_matches(object_name, detections)
+        if not matches:
+            self._speak_and_remember(f"I do not see any {object_name} to track right now.", priority=True)
+            return True
+        target = min(matches, key=lambda item: item.get('distance', 999))
+        self.tracking_target_class = object_name
+        self.tracking_target_id = target.get('object_id')
+        self._tracking_last_zone = target.get('zone')
+        self._tracking_last_distance = float(target.get('distance', 0.0))
+        self._tracking_last_seen_frame = self.frame_index
+        self._tracking_last_announce_time = time.time()
+        self.last_referenced_object = object_name
+        self._speak_and_remember(
+            f"Tracking {object_name}. It is {self._describe_detection_location(target)}.",
+            priority=True
+        )
+        return True
+
+    def _handle_stop_tracking_command(self) -> bool:
+        """Stop focused object tracking."""
+        if not self.tracking_target_class and not self.tracking_target_id:
+            return False
+        tracked_name = self.tracking_target_class or "object"
+        self.tracking_target_class = None
+        self.tracking_target_id = None
+        self._tracking_last_zone = None
+        self._tracking_last_distance = None
+        self._tracking_last_seen_frame = None
+        self._tracking_last_announce_time = 0.0
+        self._speak_and_remember(f"Stopped tracking {tracked_name}.", priority=True, bypass_pause=True)
+        return True
+
+    def _update_tracking_state(self, tracked_objects):
+        """Emit focused tracking updates only when the target meaningfully changes."""
+        if not self.tracking_target_class and self.tracking_target_id is None:
+            return
+
+        target = None
+        if self.tracking_target_id is not None:
+            for det in tracked_objects:
+                if det.get('object_id') == self.tracking_target_id:
+                    target = det
+                    break
+
+        if target is None and self.tracking_target_class:
+            matches = self._find_detection_matches(self.tracking_target_class, tracked_objects)
+            if matches:
+                target = min(matches, key=lambda item: item.get('distance', 999))
+                self.tracking_target_id = target.get('object_id')
+
+        now = time.time()
+        if target is None:
+            if self._tracking_last_seen_frame is not None and self.frame_index - self._tracking_last_seen_frame > 5:
+                if now - self._tracking_last_announce_time > 2.0:
+                    self._speak_and_remember(
+                        f"I lost the {self.tracking_target_class or 'tracked object'}.",
+                        priority=True
+                    )
+                    self._tracking_last_announce_time = now
+                    self._tracking_last_seen_frame = None
+            return
+
+        zone = target.get('zone')
+        distance = float(target.get('distance', 0.0))
+        reacquired = self._tracking_last_seen_frame is None
+        zone_changed = zone != self._tracking_last_zone and self._tracking_last_zone is not None
+        distance_changed = (
+            self._tracking_last_distance is not None and
+            abs(distance - self._tracking_last_distance) >= 0.6
+        )
+
+        self._tracking_last_seen_frame = self.frame_index
+        self._tracking_last_zone = zone
+        self._tracking_last_distance = distance
+
+        if now - self._tracking_last_announce_time < 1.5:
+            return
+        if reacquired:
+            self._speak_and_remember(
+                f"I found the {target.get('class_name', self.tracking_target_class or 'object')} again {self._describe_detection_location(target)}.",
+                priority=True
+            )
+            self._tracking_last_announce_time = now
+        elif zone_changed or distance_changed:
+            self._speak_and_remember(
+                f"Tracked {target.get('class_name', self.tracking_target_class or 'object')} is now {self._describe_detection_location(target)}.",
+                priority=True
+            )
+            self._tracking_last_announce_time = now
+
+    def _handle_closest_query(self, text: str) -> bool:
+        """Handle questions asking for the nearest object or nearest object of a class."""
+        if not any(marker in text for marker in ['closest', 'nearest', 'nearby']):
+            return False
+
+        detections = self._get_last_detections_snapshot()
+        if not detections:
+            self._speak_and_remember("I do not see anything right now.", priority=True)
+            return True
+
+        object_name = self._resolve_query_target_object(text)
+        zone_filter = self._extract_zone_filter(text)
+        candidates = detections
+        if object_name:
+            candidates = self._find_detection_matches(object_name, detections)
+            if not candidates:
+                self._speak_and_remember(f"I do not see any {object_name} right now.", priority=True)
+                return True
+        candidates = self._get_zone_candidates(candidates, zone_filter)
+        if not candidates:
+            if object_name and zone_filter:
+                self._speak_and_remember(f"I do not see any {object_name} {self._format_zone_phrase(zone_filter)}.", priority=True)
+            else:
+                self._speak_and_remember(f"I do not see anything {self._format_zone_phrase(zone_filter)}.", priority=True)
+            return True
+
+        closest = min(candidates, key=lambda x: x.get('distance', 999))
+        self.last_referenced_object = closest.get('class_name', object_name)
+        self._speak_and_remember(
+            f"The closest {closest.get('class_name', 'object')} is {self._describe_detection_location(closest)}.",
+            priority=True
+        )
+        return True
+
+    def _handle_zone_inventory_query(self, text: str) -> bool:
+        """Handle 'what is on my left/right/center' style queries."""
+        zone = self._extract_zone_filter(text)
+        if not zone or not any(marker in text for marker in ['what is on', 'what is in', 'what is at', 'what objects', 'what do you see on']):
+            return False
+        detections = self._get_last_detections_snapshot()
+        zone_items = self._get_zone_candidates(detections, zone)
+        if not zone_items:
+            self._speak_and_remember(f"I do not see anything {self._format_zone_phrase(zone)}.", priority=True)
+            return True
+        include_distance = self.response_mode == "detailed" or self._is_detailed_detection_query(text)
+        self._speak_and_remember(self._build_detection_report(zone_items, include_distance=include_distance), priority=True)
+        return True
+
+    def _handle_clear_path_query(self, text: str) -> bool:
+        """Handle clear-path and safe-side questions deterministically."""
+        lowered = text.lower()
+        if not any(marker in lowered for marker in ['path clear', 'is the path clear', 'safe to walk', 'which side is safer', 'which side is clear', 'safer side']):
+            return False
+
+        detections = self._get_last_detections_snapshot()
+        scores = self._compute_zone_hazard_scores(detections)
+        center_items = self._get_zone_candidates(detections, 'center')
+
+        if any(marker in lowered for marker in ['which side is safer', 'which side is clear', 'safer side']):
+            left_score = scores['left']
+            right_score = scores['right']
+            if left_score == 0 and right_score == 0:
+                self._speak_and_remember("Both left and right sides look clear.", priority=True)
+            else:
+                safer_side = 'left' if left_score <= right_score else 'right'
+                self._speak_and_remember(f"The {safer_side} side looks safer right now.", priority=True)
+            return True
+
+        if not center_items:
+            self._speak_and_remember("The center path looks clear.", priority=True)
+            return True
+
+        closest_center = min(center_items, key=lambda item: item.get('distance', 999))
+        if closest_center.get('distance', 999) >= 2.0:
+            self._speak_and_remember("The center path looks mostly clear.", priority=True)
+        else:
+            scores_lr = {zone: scores[zone] for zone in ['left', 'right']}
+            safer_side = min(scores_lr, key=scores_lr.get)
+            self._speak_and_remember(
+                f"Caution. {closest_center.get('class_name', 'obstacle')} is {closest_center.get('distance', 0):.1f} meters ahead. The {safer_side} side looks safer.",
+                priority=True
+            )
+        return True
+
+    def _handle_multi_location_query(self, text: str) -> bool:
+        """Handle plural location questions like where are the chairs."""
+        if not any(marker in text for marker in ['where are', 'location of', 'positions of']):
+            return False
+
+        detections = self._get_last_detections_snapshot()
+        object_name = self._resolve_query_target_object(text)
+        if not object_name:
+            return False
+
+        matches = self._find_detection_matches(object_name, detections)
+        if not matches:
+            self._speak_and_remember(self._build_not_found_response(object_name, detections), priority=True)
+            return True
+
+        matches = sorted(matches, key=lambda item: item.get('distance', 999))
+        if len(matches) == 1:
+            self._speak_and_remember(
+                f"The {object_name} is {self._describe_detection_location(matches[0])}.",
+                priority=True
+            )
+            return True
+
+        zone_counts = {'left': 0, 'center': 0, 'right': 0}
+        for item in matches:
+            zone_counts[item.get('zone', 'center')] += 1
+        zone_parts = [f"{count} on your {zone}" for zone, count in zone_counts.items() if count > 0]
+        nearest = matches[0]
+        self._speak_and_remember(
+            f"I found {len(matches)} {object_name}s. The nearest is {self._describe_detection_location(nearest)}. "
+            + ", ".join(zone_parts) + ".",
+            priority=True
+        )
+        return True
+
+    def _handle_object_side_query(self, text: str) -> bool:
+        """Handle follow-up questions asking which side an object is on."""
+        if not any(marker in text for marker in ['which side', 'what side']):
+            return False
+        object_name = self._resolve_query_target_object(text)
+        detections = self._get_last_detections_snapshot()
+        if object_name:
+            matches = self._find_detection_matches(object_name, detections)
+            if not matches:
+                self._speak_and_remember(f"I do not see any {object_name} right now.", priority=True)
+                return True
+            match = min(matches, key=lambda item: item.get('distance', 999))
+        else:
+            match = self._get_closest_detection(detections)
+            if not match:
+                self._speak_and_remember("I do not see anything right now.", priority=True)
+                return True
+        self.last_referenced_object = match.get('class_name', object_name)
+        self._speak_and_remember(
+            f"The {match.get('class_name', 'object')} is {self._format_zone_phrase(match.get('zone', 'center'))}.",
+            priority=True
+        )
+        return True
 
     def _describe_detection_location(self, detection):
         distance = detection.get('distance', 0.0)
@@ -452,11 +866,40 @@ class NavSense:
         text_words_clean = [w.strip(string.punctuation) for w in text_words]
         words_set = set(text_words_clean)
 
+        # High-priority speech control commands must run before any other routing.
+        if any(phrase in text for phrase in ['repeat last', 'repeat that', 'say that again']):
+            self._handle_repeat_command()
+            return
+        if any(phrase in text for phrase in ['pause', 'be quiet', 'stop talking']):
+            self._handle_pause_speech_command()
+            return
+        if any(phrase in text for phrase in ['mute alerts', 'stop alerts', 'silence alerts']):
+            self._handle_mute_alerts_command()
+            return
+        if any(phrase in text for phrase in ['resume', 'continue speaking', 'resume alerts']):
+            self._handle_resume_command()
+            return
+        if text in {'stop', 'quiet'}:
+            self._handle_stop_command()
+            return
+        if 'stop tracking' in text:
+            if self._handle_stop_tracking_command():
+                return
+        if any(phrase in text for phrase in ['brief mode', 'short mode']):
+            self._handle_response_mode_command("brief")
+            return
+        if any(phrase in text for phrase in ['detailed mode', 'detail mode', 'full report mode']):
+            self._handle_response_mode_command("detailed")
+            return
+        if self._handle_track_command(text):
+            return
+
 
         # ── 1. Mode Switching ─────────────────────────────────────────────────
         # Uses BOTH exact phonetic phrases AND word-level fuzzy matching
         # so Whisper mishearings like "in the mode" still trigger indoor.
-        is_short = len(text_words) <= 5
+        is_short = len(text_words) <= 3
+        is_direct_mode_phrase = len(text_words) <= 2
 
         # Exact phonetic phrases (all known Whisper mishearings)
         MODE_PHRASES = {
@@ -469,7 +912,7 @@ class NavSense:
                         'java', 'garvis', 'charvis'],
         }
 
-        if is_short:
+        if is_direct_mode_phrase:
             for mode, phrases in MODE_PHRASES.items():
                 if any(p in text for p in phrases):
                     self._set_mode(mode)
@@ -478,15 +921,15 @@ class NavSense:
         # Word-level fuzzy: any single word that sounds like a mode name
         for word in text_words:
             # Prefix check: 'ind...' words in short phrases → indoor
-            if is_short and word.startswith('ind'):
+            if is_direct_mode_phrase and word.startswith('ind'):
                 self._set_mode('indoor')
                 return
-            if is_short and word.startswith('out') and len(word) >= 5:
+            if is_direct_mode_phrase and word.startswith('out') and len(word) >= 5:
                 self._set_mode('outdoor')
                 return
             for mode in ['indoor', 'outdoor', 'jarvis']:
                 score = difflib.SequenceMatcher(None, word, mode).ratio()
-                if score >= 0.60 and is_short:
+                if score >= 0.78 and is_direct_mode_phrase:
                     self._set_mode(mode)
                     return
 
@@ -526,13 +969,23 @@ class NavSense:
 
         # ── 6. Location / Distance / Safety ──────────────────────────────────
         if any(w in words_set for w in ['where', 'find', 'locate', 'location']):
+            if self._handle_multi_location_query(text):
+                return
             self._handle_location_query(text)
             return
         if any(w in words_set for w in ['distance', 'far', 'near', 'meters']):
             self._handle_distance_query(text)
             return
+        if self._handle_object_side_query(text):
+            return
         if any(w in words_set for w in ['safe', 'clear', 'obstacle', 'path', 'walk']):
+            if self._handle_clear_path_query(text):
+                return
             self._handle_safety_command()
+            return
+        if self._handle_zone_inventory_query(text):
+            return
+        if self._handle_closest_query(text):
             return
         if self._is_count_query(text) and self._handle_count_query(text):
             return
@@ -609,11 +1062,15 @@ class NavSense:
         Mixed rule-based + LLM query handler.
         """
         detections = self._get_last_detections_snapshot()
+        if self._is_detailed_detection_query(text):
+            self._speak_and_remember(self._build_detection_report(detections, include_distance=True), priority=True)
+            return
+
         if self._is_scene_summary_query(text) or text in {'tell me', 'describe'}:
             self._handle_scene_query()
             return
 
-        asked_class = self._extract_target_object(text)
+        asked_class = self._resolve_query_target_object(text)
         if asked_class:
             matches = self._find_detection_matches(asked_class, detections)
             if matches:
@@ -678,35 +1135,17 @@ class NavSense:
     def _handle_scene_query(self):
         """Handle 'what do you see' queries."""
         detections = self._get_last_detections_snapshot()
-        
-        # Check mode - Only use LLM for Jarvis mode
-        if self.current_mode != 'jarvis':
-            # Fast Path: Simple list of objects
-            if not detections:
-                self._speak_and_remember("I don't see anything right now.", priority=True)
-            else:
-                # Group by class
-                counts = {}
-                for d in detections:
-                    cls = d.get('class_name', d.get('class', 'object'))
-                    counts[cls] = counts.get(cls, 0) + 1
-                
-                summary = ", ".join(f"{count} {name}{'s' if count > 1 else ''}" for name, count in counts.items())
-                self._speak_and_remember(f"I see {summary}.", priority=True)
+        if not detections:
+            self._speak_and_remember("I don't see anything right now.", priority=True)
             return
 
-        self._speak_and_remember("Let me look around...", priority=True)
-        self._llm_busy = True
-        try:
-            description = self.llm.generate_scene_description(detections)
-        finally:
-            self._llm_busy = False
-        self._speak_and_remember(description or "I don't see anything specific.", priority=True)
+        include_distance = self.response_mode == "detailed"
+        self._speak_and_remember(self._build_detection_report(detections, include_distance=include_distance), priority=True)
     
     def _handle_location_query(self, text: str = ""):
         """Handle "where is X" queries with voice response."""
         enhanced = self._get_last_detections_snapshot()
-        object_name = self._extract_target_object(text)
+        object_name = self._resolve_query_target_object(text)
 
         if not object_name:
             if not enhanced:
@@ -718,23 +1157,37 @@ class NavSense:
             if not matches:
                 self._speak_and_remember(self._build_not_found_response(object_name, enhanced), priority=True)
                 return
+            zone_filter = self._extract_zone_filter(text)
+            if zone_filter:
+                matches = [item for item in matches if item.get('zone') == zone_filter]
+                if not matches:
+                    self._speak_and_remember(f"I do not see any {object_name} on your {zone_filter} side right now.", priority=True)
+                    return
             match = min(matches, key=lambda x: x.get('distance', 999))
 
+        self.last_referenced_object = match.get('class_name', object_name)
         response = f"The {match['class_name']} is {self._describe_detection_location(match)}."
         self._speak_and_remember(response, priority=True)
 
     def _handle_distance_query(self, text: str):
         """Handle 'how far' queries using cached detections for fast, consistent response."""
         enhanced_detections = self._get_last_detections_snapshot()
-        self._llm_busy = True
-        try:
-            if self.llm and self.llm.check_connection():
-                response = self.llm.answer_query(text, enhanced_detections)
-            else:
-                response = self._fast_distance_fallback(enhanced_detections)
-        finally:
-            self._llm_busy = False
-        self._speak_and_remember(response or "I don't have distance information right now.", priority=True)
+        object_name = self._resolve_query_target_object(text)
+        zone_filter = self._extract_zone_filter(text)
+        candidates = enhanced_detections
+        if object_name:
+            candidates = self._find_detection_matches(object_name, enhanced_detections)
+        candidates = self._get_zone_candidates(candidates, zone_filter)
+        if not candidates:
+            response = f"I do not have distance information for {object_name} right now." if object_name else "I don't have distance information right now."
+            self._speak_and_remember(response, priority=True)
+            return
+        closest = min(candidates, key=lambda item: item.get('distance', 999))
+        self.last_referenced_object = closest.get('class_name', object_name)
+        self._speak_and_remember(
+            f"The {closest.get('class_name', 'object')} is {closest.get('distance', 0):.1f} meters away {self._format_zone_phrase(closest.get('zone', 'center'))}.",
+            priority=True
+        )
     
     def _handle_chair_command(self):
         """Intelligent chair reporting."""
@@ -817,41 +1270,41 @@ class NavSense:
             return
         
         self._speak_and_remember("Scanning environment...", priority=True)
-        # Summarize by zone
-        report = []
-        for zone in ['left', 'center', 'right']:
-            zone_dets = [d for d in detections if d['zone'] == zone]
-            if zone_dets:
-                names = list(set([d['class_name'] for d in zone_dets]))
-                report.append(f"On your {zone}, I see {' and '.join(names[:2])}")
-        
-        if report:
-            self._speak_and_remember(". ".join(report) + ".")
-        else:
-            self._speak_and_remember("Room looks mostly clear.")
+        include_distance = self.response_mode == "detailed" or len(detections) <= 4
+        self._speak_and_remember(self._build_detection_report(detections, include_distance=include_distance))
 
     def _handle_safety_command(self):
         """Direct safety path analysis."""
         detections = self._get_last_detections_snapshot()
+        scores = self._compute_zone_hazard_scores(detections)
         front_obstacles = [d for d in detections if d['zone'] == 'center' and d['distance'] < 2.0]
         
         if not front_obstacles:
-            self._speak_and_remember("The path ahead looks mostly clear. Proceed with caution.", priority=True)
+            safer_side = min(scores, key=scores.get) if any(scores.values()) else 'center'
+            if safer_side == 'center':
+                self._speak_and_remember("The path ahead looks mostly clear. Proceed with caution.", priority=True)
+            else:
+                self._speak_and_remember(f"The center path is clear. The {safer_side} side also looks safe.", priority=True)
         else:
             closest = min(front_obstacles, key=lambda x: x['distance'])
-            self._speak_and_remember(f"Caution. There is a {closest['class_name']} only {closest['distance']:.1f} meters ahead.", priority=True)
+            left_right_scores = {zone: scores[zone] for zone in ['left', 'right']}
+            safer_side = min(left_right_scores, key=left_right_scores.get)
+            self._speak_and_remember(
+                f"Caution. There is a {closest['class_name']} only {closest['distance']:.1f} meters ahead. Move toward the {safer_side} side.",
+                priority=True
+            )
 
     def _handle_repeat_command(self):
         """Repeat the last spoken report."""
         if self.last_voice_report:
             print(f"[Command] 🔄 Repeating: {self.last_voice_report}")
-            self._speak_and_remember(f"I said: {self.last_voice_report}", priority=True)
+            self._speak_and_remember(f"I said: {self.last_voice_report}", priority=True, bypass_pause=True)
         else:
-            self._speak_and_remember("I haven't said anything yet.")
+            self._speak_and_remember("I haven't said anything yet.", bypass_pause=True)
 
     def _handle_help_command(self):
         """List major command categories."""
-        guide = "You can ask: Where is something? What do you see? Scan room. Is it safe to walk? Repeat that. Or switch to indoor, outdoor, or jarvis mode."
+        guide = "You can ask where something is, what is on your left or right, which side is safer, track an object, repeat last, or switch to indoor, outdoor, or jarvis mode."
         self._speak_and_remember(guide, priority=True)
     
     def _main_loop(self):
@@ -919,13 +1372,15 @@ class NavSense:
                     self.frame_index += 1
                     if self.session_logger:
                         self.session_logger.log_detection_frame(self.frame_index, self.current_mode, tracked_objects)
+
+                    self._update_tracking_state(tracked_objects)
                     
                     # Evaluate for alerts
                     alerts = self.alert_system.evaluate_detections(tracked_objects)
                     
                     # Speak high-priority alerts
                     current_time = time.time()
-                    if current_time - last_alert_time > 1.2:  # Slightly longer throttle for combined speech
+                    if not self.alerts_muted and not self.speech_paused and current_time - last_alert_time > 1.2:  # Slightly longer throttle for combined speech
                         speakable_alerts = [a for a in alerts[:3] if self.alert_system.should_speak_alert(a)]
                         
                         if speakable_alerts:
