@@ -33,13 +33,17 @@ from core.alert_system import AlertSystem
 from core.llm_handler import LLMHandler
 from core.object_tracker import SimpleTracker
 from core.session_logger import SessionLogger
+from core.ultrasonic_sensor import UltrasonicSensor
+from core.imu_sensor import MPU6050Sensor
+from core.sensor_fusion import SensorFusion
 
 
 class NavSense:
     """Main NavSense application."""
     
-    def __init__(self):
+    def __init__(self, config_path: str | None = None):
         """Initialize NavSense application."""
+        self.config_path = config_path or self._resolve_config_path()
         self.config = None
         self.object_data = None
         
@@ -54,6 +58,10 @@ class NavSense:
         self.llm = None
         self.tracker = None
         self.session_logger = None
+        self.ultrasonic = None
+        self.imu = None
+        self.sensor_fusion = None
+        self.last_sensor_packet = {}
         self.last_detections = []
         self._detections_lock = threading.Lock()
         self._empty_frame_count = 0
@@ -97,19 +105,36 @@ class NavSense:
         
         # Display
         self.display_thread = None
+        self.show_window = True
+
+    @staticmethod
+    def _resolve_config_path() -> str:
+        """Resolve config path from CLI, env var, or default file."""
+        cli_args = sys.argv[1:]
+        if '--config' in cli_args:
+            idx = cli_args.index('--config')
+            if idx + 1 < len(cli_args):
+                return cli_args[idx + 1]
+        env_path = os.getenv('NAVSENSE_CONFIG')
+        if env_path:
+            return env_path
+        return 'config/settings.yaml'
         
     def load_config(self) -> bool:
         """Load configuration files."""
         try:
-            print("[NavSense] Loading configuration...")
+            print(f"[NavSense] Loading configuration from {self.config_path}...")
             
-            with open('config/settings.yaml', 'r') as f:
+            with open(self.config_path, 'r') as f:
                 self.config = yaml.safe_load(f)
             
             with open('config/object_data.json', 'r') as f:
                 self.object_data = json.load(f)
             
             self.speech_priority = self.config.get('tts', {}).get('speech_priority', False)
+            platform_config = self.config.get('platform', {})
+            headless = bool(platform_config.get('headless', False))
+            self.show_window = bool(self.config.get('display', {}).get('show_window', True)) and not headless
             
             self.user_name = self.config.get('tts', {}).get('user_name', 'Joe')
             self.session_logger = SessionLogger(self.config.get('logging', {}))
@@ -133,7 +158,9 @@ class NavSense:
             
             # [1/5] Initializing camera...
             print("\n[1/5] Initializing camera...")
-            self.camera = CameraHandler(self.config['camera'])
+            camera_config = dict(self.config['camera'])
+            camera_config['platform'] = self.config.get('platform', {}).get('target', 'laptop')
+            self.camera = CameraHandler(camera_config)
             if not self.camera.initialize():
                 print("[NavSense] ❌ CRITICAL ERROR: Camera initialization failed.")
                 return False
@@ -178,6 +205,16 @@ class NavSense:
             print("\n[7/7] Initializing object tracker...")
             self.tracker = SimpleTracker(max_disappeared=5, max_distance=120.0)
             print("[7/7] Tracker initialized")
+
+            sensor_config = self.config.get('sensors', {})
+            self.sensor_fusion = SensorFusion(sensor_config.get('fusion', {}))
+            self.ultrasonic = UltrasonicSensor(sensor_config.get('ultrasonic', {}))
+            self.imu = MPU6050Sensor(sensor_config.get('imu', {}))
+
+            if self.ultrasonic.initialize():
+                print("[Sensors] Ultrasonic sensor ready")
+            if self.imu.initialize():
+                print("[Sensors] MPU6050 sensor ready")
             
             print("\n" + "="*60)
             print("All components initialized successfully!")
@@ -214,9 +251,10 @@ class NavSense:
         print("[NavSense] Starting voice recognition...")
         self.voice.start_listening(self._on_voice_command)
         
-        # Start display thread
-        self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
-        self.display_thread.start()
+        # Start display thread if enabled
+        if self.show_window:
+            self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
+            self.display_thread.start()
         
         # Main detection loop
         self._main_loop()
@@ -574,7 +612,20 @@ class NavSense:
             scores[zone] = len(zone_items) * 1.5 + (3.5 / nearest_distance)
             if zone == 'center':
                 scores[zone] += 1.0
+        if self.sensor_fusion:
+            forward_distance = self.sensor_fusion.forward_obstacle_distance()
+            if forward_distance is not None:
+                scores['center'] += 5.0 if forward_distance <= 0.8 else (2.5 if forward_distance <= 1.5 else 0.0)
         return scores
+
+    def _read_sensor_packet(self):
+        """Read ultrasonic and IMU data into one normalized packet."""
+        if not self.sensor_fusion:
+            return {}
+        ultrasonic = self.ultrasonic.read() if self.ultrasonic else None
+        imu = self.imu.read() if self.imu else None
+        self.last_sensor_packet = self.sensor_fusion.update(ultrasonic, imu)
+        return self.last_sensor_packet
 
     def _handle_pause_speech_command(self):
         """Pause spoken responses until resumed."""
@@ -756,6 +807,7 @@ class NavSense:
         detections = self._get_last_detections_snapshot()
         scores = self._compute_zone_hazard_scores(detections)
         center_items = self._get_zone_candidates(detections, 'center')
+        forward_distance = self.sensor_fusion.forward_obstacle_distance() if self.sensor_fusion else None
 
         if any(marker in lowered for marker in ['which side is safer', 'which side is clear', 'safer side']):
             left_score = scores['left']
@@ -765,6 +817,15 @@ class NavSense:
             else:
                 safer_side = 'left' if left_score <= right_score else 'right'
                 self._speak_and_remember(f"The {safer_side} side looks safer right now.", priority=True)
+            return True
+
+        if forward_distance is not None and forward_distance < 0.8:
+            scores_lr = {zone: scores[zone] for zone in ['left', 'right']}
+            safer_side = min(scores_lr, key=scores_lr.get)
+            self._speak_and_remember(
+                f"Caution. Ultrasonic sensor shows an obstacle {forward_distance:.1f} meters ahead. The {safer_side} side looks safer.",
+                priority=True
+            )
             return True
 
         if not center_items:
@@ -1339,8 +1400,9 @@ class NavSense:
                     time.sleep(0.01)
                     continue
                 
-                # Process detections
+                    # Process detections
                 if self.current_mode:
+                    self._read_sensor_packet()
                     if self._llm_busy:
                         time.sleep(0.02)
                         frame_count += 1
@@ -1375,6 +1437,8 @@ class NavSense:
                         tracked_objects = self.tracker.update(enhanced_detections)
                     else:
                         tracked_objects = enhanced_detections
+                    if self.sensor_fusion:
+                        tracked_objects = self.sensor_fusion.augment_detections(tracked_objects)
                     
                     if tracked_objects:
                         self._empty_frame_count = 0
@@ -1394,6 +1458,18 @@ class NavSense:
                     
                     # Evaluate for alerts
                     alerts = self.alert_system.evaluate_detections(tracked_objects)
+                    forward_distance = self.sensor_fusion.forward_obstacle_distance() if self.sensor_fusion else None
+                    if forward_distance is not None and forward_distance < 0.8:
+                        alerts.insert(0, {
+                            'class_name': 'obstacle',
+                            'distance': forward_distance,
+                            'direction_text': 'center',
+                            'zone': 'center',
+                            'priority': 'high',
+                            'priority_score': 200.0,
+                            'message': f"Warning: obstacle at {int(forward_distance * 100)} centimeters, center",
+                            'timestamp': time.time(),
+                        })
                     
                     # Speak high-priority alerts
                     current_time = time.time()
@@ -1569,6 +1645,12 @@ class NavSense:
         
         if self.voice:
             self.voice.shutdown()
+
+        if self.ultrasonic:
+            self.ultrasonic.shutdown()
+
+        if self.imu:
+            self.imu.shutdown()
         
         if self.camera:
             self.camera.release()

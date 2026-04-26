@@ -1,0 +1,8 @@
+# NavSense laptop/desktop additions
+# Install after shared requirements:
+#   python -m pip install -r requirements.txt -r requirements-laptop.txt
+
+torch>=2.0.0
+torchvision>=0.15.0
+pyaudio>=0.2.13
+faster-whisper>=1.0.3

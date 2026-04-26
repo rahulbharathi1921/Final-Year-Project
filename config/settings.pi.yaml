@@ -1,0 +1,130 @@
+# NavSense Raspberry Pi 5 profile
+# Target hardware:
+# - Pi Camera Module v1
+# - HC-SR04 ultrasonic sensor centered with the camera
+# - MPU6050 mounted slightly down-left of the camera
+
+platform:
+  target: "raspberry_pi"
+  headless: true
+
+camera:
+  backend: "picamera2"
+  device_id: 0
+  width: 640
+  height: 480
+  fps_target: 15
+  fov_horizontal: 60
+
+detection:
+  model_path: "models/yolov5n.pt"
+  confidence_threshold: 0.35
+  confidence: 0.35
+  iou_threshold: 0.45
+  max_detections: 10
+
+distance:
+  estimation_method: "known_size"
+  accuracy_tolerance: 0.4
+  focal_length: 615.0
+
+alerts:
+  cooldown_seconds: 2.0
+  high_priority_distance: 1.0
+  medium_priority_distance: 3.0
+  danger_thresholds:
+    person: 1.0
+    bicycle: 1.2
+    dog: 1.0
+    vehicle: 3.0
+    chair: 0.5
+    bench: 0.7
+    couch: 0.8
+    dining table: 0.7
+    traffic light: 1.5
+    stop sign: 1.5
+
+voice:
+  recognition_engine: "google"
+  model_size: "tiny.en"
+  language: "en-US"
+  timeout: 5
+  phrase_time_limit: 4
+  min_rms: 500
+  barge_in_rms_threshold: 1400
+  echo_guard_seconds: 2.2
+  post_tts_rms_threshold: 1050
+
+tts:
+  engine: "pyttsx3"
+  rate: 150
+  volume: 1.0
+  voice_index: 0
+  user_name: "Joe"
+  speech_priority: true
+
+llm:
+  provider: "gemini"
+  api_key_env: "GEMINI_API_KEY"
+  model: "gemini-2.5-flash-lite"
+  timeout: 15
+  temperature: 0.2
+  max_tokens: 80
+
+modes:
+  indoor:
+    enabled: true
+    full_detection: true
+    alert_distance_multiplier: 1.0
+  outdoor:
+    enabled: true
+    full_detection: true
+    alert_distance_multiplier: 1.5
+  jarvis:
+    enabled: true
+    conversational: true
+    full_detection: true
+    llm_integration: true
+
+display:
+  show_window: false
+  window_width: 1280
+  window_height: 720
+  font_scale: 0.6
+  line_thickness: 2
+  show_fps: true
+  show_confidence: true
+  colors:
+    high_priority: [0, 0, 255]
+    medium_priority: [0, 255, 255]
+    low_priority: [255, 0, 0]
+    text: [255, 255, 255]
+
+sensors:
+  ultrasonic:
+    enabled: true
+    trigger_pin: 23
+    echo_pin: 24
+    max_distance_m: 3.0
+    sample_count: 3
+    offset_m: 0.0
+    mount_position: "center"
+  imu:
+    enabled: true
+    bus: 1
+    address: "0x68"
+    mount_position: "down_left_of_camera"
+  fusion:
+    forward_alert_distance_m: 0.8
+    forward_caution_distance_m: 1.5
+    tilt_warning_deg: 18.0
+    primary_forward_sensor: "ultrasonic"
+    layout_note: "camera_centered_ultrasonic_centered_imu_down_left"
+
+logging:
+  enabled: true
+  log_directory: "logs"
+  session_prefix: "session_"
+  save_detections: true
+  save_alerts: true
+  save_voice_commands: true

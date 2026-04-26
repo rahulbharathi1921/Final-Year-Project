@@ -9,6 +9,11 @@ import threading
 import time
 from typing import Optional, Tuple
 
+try:
+    from picamera2 import Picamera2
+except Exception:  # pragma: no cover - unavailable on laptop/dev systems
+    Picamera2 = None
+
 
 class CameraHandler:
     """Handles camera capture and frame management."""
@@ -33,6 +38,9 @@ class CameraHandler:
         self.fps_target = config.get('fps_target', 24)
         self.fov_horizontal = config.get('fov_horizontal', 60)
         self.device_id = config.get('device_id', 0)
+        self.backend = str(config.get('backend', 'opencv')).lower()
+        self.platform = str(config.get('platform', 'laptop')).lower()
+        self.is_pi_camera = False
         
         # FPS tracking
         self.fps = 0
@@ -48,20 +56,32 @@ class CameraHandler:
         """
         try:
             print(f"[CameraHandler] Initializing camera {self.device_id}...")
-            self.camera = cv2.VideoCapture(self.device_id)
+            if self.backend in {'picamera2', 'auto'} and self.platform in {'raspberry_pi', 'pi', 'raspberrypi'}:
+                if self._initialize_picamera2():
+                    self.is_pi_camera = True
+                elif self.backend == 'picamera2':
+                    return False
+
+            if not self.is_pi_camera:
+                self.camera = cv2.VideoCapture(self.device_id)
             
-            if not self.camera.isOpened():
+            if not self.is_pi_camera and not self.camera.isOpened():
                 print("[CameraHandler] ERROR: Could not open camera")
                 return False
             
             # Set camera properties
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            self.camera.set(cv2.CAP_PROP_FPS, self.fps_target)
+            if not self.is_pi_camera:
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                self.camera.set(cv2.CAP_PROP_FPS, self.fps_target)
             
             # Verify settings
-            actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if self.is_pi_camera:
+                actual_width = self.width
+                actual_height = self.height
+            else:
+                actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
             print(f"[CameraHandler] Camera initialized: {actual_width}x{actual_height}")
             
@@ -75,11 +95,40 @@ class CameraHandler:
         except Exception as e:
             print(f"[CameraHandler] ERROR: Failed to initialize camera: {e}")
             return False
+
+    def _initialize_picamera2(self) -> bool:
+        """Initialize Picamera2/libcamera when running on Raspberry Pi."""
+        if Picamera2 is None:
+            print("[CameraHandler] Picamera2 not available; falling back to OpenCV camera.")
+            return False
+        try:
+            self.camera = Picamera2()
+            config = self.camera.create_preview_configuration(
+                main={"size": (self.width, self.height), "format": "RGB888"}
+            )
+            self.camera.configure(config)
+            self.camera.start()
+            time.sleep(0.2)
+            print("[CameraHandler] Picamera2 backend initialized")
+            return True
+        except Exception as exc:
+            print(f"[CameraHandler] Picamera2 init failed: {exc}")
+            self.camera = None
+            return False
     
     def _capture_loop(self):
         """Internal loop for continuous frame capture."""
         while self.is_running:
-            ret, frame = self.camera.read()
+            if self.is_pi_camera:
+                try:
+                    frame = self.camera.capture_array()
+                    ret = frame is not None
+                    if ret and frame.ndim == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                except Exception:
+                    ret, frame = False, None
+            else:
+                ret, frame = self.camera.read()
             
             if ret:
                 with self.frame_lock:
@@ -143,7 +192,14 @@ class CameraHandler:
             self.capture_thread.join(timeout=2.0)
         
         if self.camera:
-            self.camera.release()
+            try:
+                if self.is_pi_camera:
+                    self.camera.stop()
+                    self.camera.close()
+                else:
+                    self.camera.release()
+            except Exception:
+                pass
             self.camera = None
         
         print("[CameraHandler] Camera released")

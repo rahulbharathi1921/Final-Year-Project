@@ -1,0 +1,12 @@
+# NavSense Raspberry Pi additions
+# Install after shared requirements:
+#   python -m pip install -r requirements.txt -r requirements-pi.txt
+
+# Keep the Pi stack as light as possible.
+pyaudio>=0.2.13
+faster-whisper>=1.0.3
+
+# Important:
+# - picamera2 is usually installed from Raspberry Pi OS packages, not pip
+# - torch/torchvision on Raspberry Pi depend on your exact OS/image and are
+#   often better installed separately after validating available wheels

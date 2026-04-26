@@ -1,26 +1,26 @@
-# NavSense Ai assistant Requirements - Phase 1 
-# Core dependencies for object detection, camera, and voice interface
+# NavSense shared requirements
+# Install this first on every platform:
+#   python -m pip install -r requirements.txt
 
-# Computer Vision & Detection
+# Core computer vision and app runtime
 opencv-python>=4.8.0
-torch>=2.0.0
-torchvision>=0.15.0
 numpy>=1.24.0
 ultralytics>=8.0.0
 scipy>=1.10.0
+pillow>=10.0.0
+pyyaml>=6.0
 
-# Voice Recognition & TTS
+# Voice / app logic
 SpeechRecognition>=3.10.0
-pyttsx3>=2.90
-pyaudio>=0.2.13
-
-# LLM Integration (Phase 2)
 requests>=2.31.0
 python-dotenv>=1.0.1
 
-# Utilities
-pyyaml>=6.0
-pillow>=10.0.0
+# TTS / media
+pyttsx3>=2.90
+pygame>=2.6.0
+gTTS>=2.5.1
 
-# Optional but recommended for better performance
-# pip install --upgrade pip setuptools wheel
+# Raspberry Pi sensor helpers are safe cross-platform,
+# but only become active on Pi when configured.
+gpiozero>=2.0.1
+smbus2>=0.4.3
